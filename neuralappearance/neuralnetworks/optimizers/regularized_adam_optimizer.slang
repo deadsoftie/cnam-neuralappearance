@@ -42,14 +42,22 @@ public struct RegularizedAdamOptimizer<T : IReal> : IOptimizer<T>
     public T variance_correction_factor;
     public T l2_regularization;
     public bool ignore_invalid_gradients;
+    // Word 0 counts non-finite gradients, word 1 is set once any occurs, so
+    // a wrapped count cannot hide them.
+    public RWByteAddressBuffer.Handle invalid_gradient_counter;
 
     public void step(inout State state, inout T param, inout T grad)
     {
         // Apply L2 regularization directly to the gradient.
         grad += l2_regularization * param;
 
-        if (ignore_invalid_gradients && !isfinite(grad))
-            grad = T(0.0f);
+        if (!isfinite(grad))
+        {
+            invalid_gradient_counter.InterlockedAdd(0, 1);
+            invalid_gradient_counter.InterlockedOr(4, 1);
+            if (ignore_invalid_gradients)
+                grad = T(0.0f);
+        }
 
         // Update the moving moments with ``lerp()``.
         state.mean = lerp(grad, state.mean, beta1);

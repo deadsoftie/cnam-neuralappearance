@@ -264,6 +264,9 @@ class TrainingPhaseRuntime:
         print('Use regularized Adam optimizer.')
         self.adam_optimizer = nn.RegularizedAdamOptimizer(
             start_scale * self.learning_rate,
+            invalid_gradient_counter=nn.RegularizedAdamOptimizer.create_invalid_gradient_counter(
+                self.neural_model.module.device
+            ),
             **optim_config,
         )
         # Keep an FP32 copy of every half-precision parameter. Adam updates that
@@ -755,6 +758,9 @@ class TrainingJob:
         total_time = time.perf_counter() - opt_start_time
         optimization_time = total_time - ckpt_time
         iterations_per_second = phase_runtime.num_iterations / optimization_time
+        invalid_gradients, invalid_gradients_seen = (
+            phase_runtime.adam_optimizer.read_invalid_gradients()
+        )
         phase_state = phase_runtime.phase_state
         print('------------------------------------------')
         print(f'{phase_state.display_label} done!')
@@ -762,6 +768,7 @@ class TrainingJob:
         print(f'  * Optimization time: {optimization_time:.2f}s')
         print(f'  * Iterations/second: {iterations_per_second:.2f}')
         print(f'  * Checkpoint time: {ckpt_time:.2f}s')
+        print(f'  * Non-finite gradients: {invalid_gradients}')
         print('------------------------------------------')
 
         self.summary['phases'].append(
@@ -773,6 +780,8 @@ class TrainingJob:
                 'optimization_time': optimization_time,
                 'iterations_per_second': iterations_per_second,
                 'checkpoint_time': ckpt_time,
+                'invalid_gradients': invalid_gradients,
+                'invalid_gradients_seen': invalid_gradients_seen,
             }
         )
         with (self.outfolder / 'summary.json').open('w') as f:
