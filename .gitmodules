@@ -1,3 +1,4 @@
 [submodule "external/falcor2"]
 	path = external/falcor2
-	url = https://github.com/NVlabs/falcor2
+	url = https://github.com/deadsoftie/cnam-falcor2.git
+	branch = cnam
