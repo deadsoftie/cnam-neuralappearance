@@ -768,7 +768,7 @@ class TrainingJob:
         print(f'  * Optimization time: {optimization_time:.2f}s')
         print(f'  * Iterations/second: {iterations_per_second:.2f}')
         print(f'  * Checkpoint time: {ckpt_time:.2f}s')
-        print(f'  * Non-finite gradients: {invalid_gradients}')
+        print(f'  * Non-finite gradients: {invalid_gradients} (any: {invalid_gradients_seen})')
         print('------------------------------------------')
 
         self.summary['phases'].append(
