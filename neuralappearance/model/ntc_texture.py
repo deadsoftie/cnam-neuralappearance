@@ -36,6 +36,8 @@ class NtcTexture:
     def __init__(self, device: spy.Device, ntc: Any):
         if ntc.num_channels != NUM_LATENTS:
             raise ValueError(f'expected {NUM_LATENTS} channels, the file has {ntc.num_channels}')
+        if ntc.num_color_mips > MAX_MIPS:
+            raise ValueError(f'at most {MAX_MIPS} color mips, the file has {ntc.num_color_mips}')
         self.device = device
         self.num_layers = len(ntc.latents[0].layers)
         self.num_mip_levels = ntc.num_color_mips
