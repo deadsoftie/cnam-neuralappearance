@@ -784,10 +784,19 @@ class TrainingJob:
                 'invalid_gradients_seen': invalid_gradients_seen,
             }
         )
-        with (self.outfolder / 'summary.json').open('w') as f:
-            json.dump(self.summary, f, indent=2)
+        self._save_summary()
 
         save_loss_plots(self.config, self.loss_series)
+
+    def record_bake_time(self, bake_time: float) -> None:
+        """Record the wall time of baking the encoder output into the latents."""
+        print(f'  * Bake time: {bake_time:.2f}s')
+        self.summary['bake_time'] = bake_time
+        self._save_summary()
+
+    def _save_summary(self) -> None:
+        with (self.outfolder / 'summary.json').open('w') as f:
+            json.dump(self.summary, f, indent=2)
 
 
 def training_main(args) -> None:
@@ -952,6 +961,7 @@ def training_bsdf_encoding(job: TrainingJob) -> None:
     assert len(neural_model.encoder.instances) == 1, (
         'Must have pruned to a single encoder instance by now.'
     )
+    bake_start_time = time.perf_counter()
     neural_model.latent_texture.instances[0].generate_from_encoder(
         module,
         job.data_generators,
@@ -959,6 +969,8 @@ def training_bsdf_encoding(job: TrainingJob) -> None:
         neural_model.num_mip_levels,
         neural_model.encoder.instances[0],
     )
+    job.device.wait()
+    job.record_bake_time(time.perf_counter() - bake_start_time)
     neural_model.decoder.status = 'Done'
     neural_model.encoder.status = 'Done'
     neural_model.latent_texture.status = 'Done'

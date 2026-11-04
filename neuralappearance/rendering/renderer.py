@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 WIDTH = 1920
 HEIGHT = 1080
+# Sample ``i`` of render seed ``s`` uses sample index ``s * SEED_STRIDE + i``.
+# Seed 0 is the unseeded sequence; two seeds share no samples below this spp.
+SEED_STRIDE = 65536
 
 
 def _get_scene_camera(scene: f2.Scene) -> f2.Camera:
@@ -213,12 +216,19 @@ class Renderer:
         camera: f2.Camera,
         mip_level: int,
         neural_material: bool,
+        spp: int,
+        seed: int,
     ) -> spy.Bitmap:
-        """Run one scene's hybrid path tracer for ``self.spp`` samples."""
+        """Run one scene's hybrid path tracer for ``spp`` samples of render seed ``seed``."""
+        if not 0 < spp <= SEED_STRIDE:
+            raise ValueError(f'spp must be in [1, {SEED_STRIDE}], got {spp}.')
+        if not 0 <= seed < SEED_STRIDE:
+            raise ValueError(f'Render seed must be in [0, {SEED_STRIDE}), got {seed}.')
         self._reset_accumulator()
 
-        for iteration in range(self.spp):
-            hybrid_pt.render(camera, self.output_tensor, iteration, mip_level, neural_material)
+        for iteration in range(spp):
+            sample_index = seed * SEED_STRIDE + iteration
+            hybrid_pt.render(camera, self.output_tensor, sample_index, mip_level, neural_material)
             self._utils_module.accumulator_update_and_output_inplace(
                 self.output_tensor, self._accumulator
             )
@@ -242,7 +252,23 @@ class Renderer:
                 udim_id,
                 targets,
             )
+        return [self.render_reference(material, mip_level, self.spp, 0, udim_id)]
 
+    def render_reference(
+        self,
+        material: ReferenceMaterial,
+        mip_level: int,
+        spp: int,
+        seed: int,
+        udim_id: int | None = None,
+    ) -> spy.Bitmap:
+        """Render the BSDF image of a reference material.
+
+        ``mip_level`` -1 selects the level per lookup from the ray footprint.
+        ``udim_id`` defaults to the material's first UDIM.
+        """
+        if udim_id is None:
+            udim_id = material.udims[0]
         self._apply_udim_offset(self.reference_scene, udim_id, sign=1.0)
         try:
             if material.falcor2_handle is None:
@@ -250,16 +276,16 @@ class Renderer:
             prepare_scene_material(self.reference_scene, material.falcor2_handle)
             self.reference_hybrid_pt.set_target_material(None, material.texture_resolution)
 
-            bitmap = self._render_with_accumulation(
+            return self._render_with_accumulation(
                 self.reference_hybrid_pt,
                 self.reference_camera,
                 mip_level,
                 neural_material=False,
+                spp=spp,
+                seed=seed,
             )
         finally:
             self._apply_udim_offset(self.reference_scene, udim_id, sign=-1.0)
-
-        return [bitmap]
 
     def _prepare_neural_materials(self, neural_model: NeuralModelCheckpoint) -> None:
         """Set up a neural material for hybrid path tracer rendering."""
@@ -290,23 +316,99 @@ class Renderer:
                 udim_id,
                 targets,
             )
+        return [self.render_neural(neural_model, material, mip_level, self.spp, 0, udim_id)]
 
+    def render_neural(
+        self,
+        neural_model: NeuralModelCheckpoint,
+        material: ReferenceMaterial,
+        mip_level: int,
+        spp: int,
+        seed: int,
+        udim_id: int | None = None,
+    ) -> spy.Bitmap:
+        """Render the BSDF image of ``material`` as represented by ``neural_model``.
+
+        Arguments as in ``render_reference``.
+        """
+        if udim_id is None:
+            udim_id = material.udims[0]
         self._apply_udim_offset(self.neural_scene, udim_id, sign=1.0)
         try:
             neural_material = self._get_neural_material(neural_model, material)
             prepare_scene_material(self.neural_scene, neural_material)
             self.neural_hybrid_pt.set_target_material(None, material.texture_resolution)
 
-            bitmap = self._render_with_accumulation(
+            return self._render_with_accumulation(
                 self.neural_hybrid_pt,
                 self.neural_camera,
                 mip_level,
                 neural_material=True,
+                spp=spp,
+                seed=seed,
             )
         finally:
             self._apply_udim_offset(self.neural_scene, udim_id, sign=-1.0)
 
-        return [bitmap]
+    def render_material_mask(
+        self,
+        material: ReferenceMaterial,
+        num_samples: int = 64,
+        neural_model: NeuralModelCheckpoint | None = None,
+        udim_id: int | None = None,
+    ) -> np.ndarray:
+        """Return pixels where every jittered primary ray hits ``material``.
+
+        Traces samples 0 to ``num_samples - 1`` of render seed 0. Uses the
+        reference scene, or the neural scene when ``neural_model`` is given.
+        """
+        if udim_id is None:
+            udim_id = material.udims[0]
+        if neural_model is None:
+            scene, hybrid_pt, camera = (
+                self.reference_scene,
+                self.reference_hybrid_pt,
+                self.reference_camera,
+            )
+            if material.falcor2_handle is None:
+                raise RuntimeError('Reference material does not have a falcor2 material handle.')
+            material_id = prepare_scene_material(scene, material.falcor2_handle)
+        else:
+            scene, hybrid_pt, camera = self.neural_scene, self.neural_hybrid_pt, self.neural_camera
+            neural_material = self._get_neural_material(neural_model, material)
+            material_id = prepare_scene_material(scene, neural_material)
+
+        self._apply_udim_offset(scene, udim_id, sign=1.0)
+        try:
+            hit_kernel = self._get_hit_kernel(scene, hybrid_pt, material_id)
+            camera.recompute()
+            uv = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float2')
+            wi = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float3')
+            wo = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float3')
+            hit_mask = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='uint')
+            mip_level = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='uint')
+            texel_sample = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float')
+
+            mask = np.ones((HEIGHT, WIDTH), dtype=bool)
+            for iteration in range(num_samples):
+                hit_kernel.call(
+                    camera,
+                    uv,
+                    wi,
+                    wo,
+                    hit_mask,
+                    mip_level,
+                    texel_sample,
+                    iteration,
+                    0,
+                    material.texture_resolution,
+                    1,
+                    tid=spy.grid((HEIGHT, WIDTH)),
+                )
+                mask &= hit_mask.to_numpy() != 0
+            return mask
+        finally:
+            self._apply_udim_offset(scene, udim_id, sign=-1.0)
 
     def _render_neural_aux_material(
         self,
@@ -440,37 +542,7 @@ class Renderer:
             render_buffer = spy.Tensor.zeros(
                 self.device, shape=(HEIGHT, WIDTH), dtype=f'float[{num_channels}]'
             )
-            constants = {
-                'MAX_DEPTH': hybrid_pt.max_depth,
-                'ENABLE_NEE': hybrid_pt.enable_nee,
-                'ENABLE_MIS': hybrid_pt.enable_mis,
-                'ENABLE_EMISSIVE_TRIANGLES': hybrid_pt.enable_emissive_triangles,
-                'ENABLE_ENV_MAP': hybrid_pt.enable_env_map,
-                'TARGET_MATERIAL_ID': material_id,
-            }
-
-            # Cache the compiled hit-extraction kernel. Rebuild when the scene's
-            # required modules change (e.g. materials added) or when the target
-            # ``material_id`` changes.
-            required_modules = tuple(scene.requirements.modules)
-            key = (id(scene), required_modules, material_id)
-            if key != self._hit_kernel_key:
-                self._hit_kernel_key = key
-                render_module = spy.Module(scene.render_module)
-                hit_data_module = spy.Module(
-                    self.device.load_module('rendering/hybrid/hit_data_extractor.slang'),
-                    link=[render_module] + [spy.Module(m) for m in scene.requirements.modules],
-                )
-                self._hit_kernel_base = hit_data_module.extract_hit_data.constants(
-                    constants
-                ).type_conformances(scene.requirements.type_conformances)
-
-            # Rebind scene state every call; UDIM offsets and other scene edits
-            # can mutate uniforms between auxiliary targets. Detecting those
-            # changes is not worth the bookkeeping for checkpoint renderings.
-            assert self._hit_kernel_base is not None
-            hit_kernel = self._hit_kernel_base.write(scene.bind)
-            self._hit_kernel = hit_kernel
+            hit_kernel = self._get_hit_kernel(scene, hybrid_pt, material_id)
 
             uv = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float2')
             wi = spy.Tensor.empty(self.device, (HEIGHT, WIDTH), dtype='float3')
@@ -503,6 +575,41 @@ class Renderer:
             return split_aux_channels(render_buffer_np, targets)
         finally:
             self._apply_udim_offset(scene, udim_id, sign=-1.0)
+
+    def _get_hit_kernel(self, scene: f2.Scene, hybrid_pt: HybridPathTracer, material_id: int):
+        """Return the primary-ray hit extraction kernel bound to ``scene``."""
+        constants = {
+            'MAX_DEPTH': hybrid_pt.max_depth,
+            'ENABLE_NEE': hybrid_pt.enable_nee,
+            'ENABLE_MIS': hybrid_pt.enable_mis,
+            'ENABLE_EMISSIVE_TRIANGLES': hybrid_pt.enable_emissive_triangles,
+            'ENABLE_ENV_MAP': hybrid_pt.enable_env_map,
+            'TARGET_MATERIAL_ID': material_id,
+        }
+
+        # Cache the compiled hit-extraction kernel. Rebuild when the scene's
+        # required modules change (e.g. materials added) or when the target
+        # ``material_id`` changes.
+        required_modules = tuple(scene.requirements.modules)
+        key = (id(scene), required_modules, material_id)
+        if key != self._hit_kernel_key:
+            self._hit_kernel_key = key
+            render_module = spy.Module(scene.render_module)
+            hit_data_module = spy.Module(
+                self.device.load_module('rendering/hybrid/hit_data_extractor.slang'),
+                link=[render_module] + [spy.Module(m) for m in scene.requirements.modules],
+            )
+            self._hit_kernel_base = hit_data_module.extract_hit_data.constants(
+                constants
+            ).type_conformances(scene.requirements.type_conformances)
+
+        # Rebind scene state every call; UDIM offsets and other scene edits
+        # can mutate uniforms between auxiliary targets. Detecting those
+        # changes is not worth the bookkeeping for checkpoint renderings.
+        assert self._hit_kernel_base is not None
+        hit_kernel = self._hit_kernel_base.write(scene.bind)
+        self._hit_kernel = hit_kernel
+        return hit_kernel
 
     def _apply_udim_offset(self, scene: f2.Scene, udim_id: int, sign: float) -> None:
         offset = udim_offset(udim_id)
