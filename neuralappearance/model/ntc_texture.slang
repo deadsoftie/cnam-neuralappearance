@@ -5,15 +5,89 @@
 // the device; ``ntc_texture.py`` documents the expected directory.
 #include "libntc/shaders/InferenceCoopVec.hlsli"
 import slangpy;
+import model.base_types;
+import util.texture_helpers;
+
+static const int NtcNumLatents = 8;
 
 // One NTC texture set resident on the GPU: packed BGRA4 latents, the SDK
 // latent sampler, the FP8 weight set in CoopVec layout and the SDK constants.
-struct NtcTexture
+// As a latent texture it holds one material without UDIMs: ``material_id`` is
+// ignored, ``mip_level`` is the color mip and UVs wrap. Every lookup decodes at
+// integer texels only; the lookups pick texels as the dense ``Texture`` does.
+// Decoded latents carry no gradients.
+struct NtcTexture : ILatentTexture<NtcNumLatents>
 {
     Texture2DArray.Handle latents;
     SamplerState.Handle sampler;
     ByteAddressBuffer.Handle weights;
     NtcTextureSetConstants constants;
+
+    int get_texture_resolution(int material_id)
+    {
+        return constants.imageWidth;
+    }
+
+    [BackwardDifferentiable]
+    float[NtcNumLatents] get_nearest(LatentTextureInput input)
+    {
+        return no_diff decode_nearest(input.mip_level, input.uv);
+    }
+
+    // Decodes the 4 bilinear neighbors and blends the decoded values.
+    [BackwardDifferentiable]
+    float[NtcNumLatents] get_bilinear(LatentTextureInput input)
+    {
+        return no_diff decode_bilinear(input.mip_level, input.uv);
+    }
+
+    [BackwardDifferentiable]
+    float[NtcNumLatents] get_bilinear_stochastic(LatentTextureInput input, float sample)
+    {
+        let size = uint2(mip_size(input.mip_level));
+        let uv = sample_bilinear_texel_center(input.uv, size, true, sample);
+        return no_diff decode_nearest(input.mip_level, uv);
+    }
+
+    float[NtcNumLatents] decode_nearest(int mip_level, float2 uv)
+    {
+        let size = uint2(mip_size(mip_level));
+        let texel = int2(round(uv_to_fractional_texel(uv, size, true)));
+        return decode_latents(texel, mip_level);
+    }
+
+    float[NtcNumLatents] decode_bilinear(int mip_level, float2 uv)
+    {
+        uint2 texels[4];
+        float weights[4];
+        get_bilinear_interpolation_texels_and_weights(
+            uv, uint2(mip_size(mip_level)), true, texels, weights);
+
+        float[NtcNumLatents] result = {};
+        [ForceUnroll]
+        for (int i = 0; i < 4; ++i)
+        {
+            let code = decode_latents(int2(texels[i]), mip_level);
+            [ForceUnroll]
+            for (int l = 0; l < NtcNumLatents; ++l)
+                result[l] += weights[i] * code[l];
+        }
+        return result;
+    }
+
+    // Wraps ``texel`` into color mip ``mip_level`` and decodes it. Zeros for a
+    // mip level the texture set does not have.
+    float[NtcNumLatents] decode_latents(int2 texel, int mip_level)
+    {
+        float outputs[NTC_MLP_OUTPUT_CHANNELS];
+        decode(wrap_texel(texel, mip_level), mip_level, outputs);
+
+        float[NtcNumLatents] result;
+        [ForceUnroll]
+        for (int i = 0; i < NtcNumLatents; ++i)
+            result[i] = outputs[i];
+        return result;
+    }
 
     // Decodes the integer texel of color mip ``mip_level``. The texel must lie
     // inside the mip: the SDK clamps out-of-range texels. Returns false for a
@@ -51,6 +125,12 @@ struct NtcTexture
         return true;
     }
 
+    int2 wrap_texel(int2 texel, int mip_level)
+    {
+        let size = mip_size(mip_level);
+        return ((texel % size) + size) % size;
+    }
+
     int2 mip_size(int mip_level)
     {
         return int2(
@@ -58,20 +138,29 @@ struct NtcTexture
     }
 }
 
-// Wraps an integer texel into color mip ``mip_level``.
-int2 ntc_wrap_texel(NtcTexture ntc, int2 texel, int mip_level)
-{
-    let size = ntc.mip_size(mip_level);
-    return ((texel % size) + size) % size;
-}
-
 // Decodes every texel of one color mip; ``texel`` comes from ``spy.grid``.
 // ``offset`` shifts the decoded texel, wrapped into the mip.
 void ntc_decode_mip(
     NtcTexture ntc, int mip_level, int2 offset, int2 texel, out float4 a, out float4 b)
 {
-    float outputs[NTC_MLP_OUTPUT_CHANNELS];
-    ntc.decode(ntc_wrap_texel(ntc, texel + offset, mip_level), mip_level, outputs);
+    let outputs = ntc.decode_latents(texel + offset, mip_level);
+    a = float4(outputs[0], outputs[1], outputs[2], outputs[3]);
+    b = float4(outputs[4], outputs[5], outputs[6], outputs[7]);
+}
+
+// Runs one latent lookup of ``ntc`` per call; ``filter`` 0 nearest,
+// 1 bilinear, 2 stochastic.
+void ntc_lookup(
+    NtcTexture ntc, int filter, int mip_level, float2 uv, float sample, out float4 a, out float4 b)
+{
+    LatentTextureInput input = { 0, mip_level, uv };
+    float[NtcNumLatents] outputs;
+    if (filter == 0)
+        outputs = ntc.get_nearest(input);
+    else if (filter == 1)
+        outputs = ntc.get_bilinear(input);
+    else
+        outputs = ntc.get_bilinear_stochastic(input, sample);
     a = float4(outputs[0], outputs[1], outputs[2], outputs[3]);
     b = float4(outputs[4], outputs[5], outputs[6], outputs[7]);
 }

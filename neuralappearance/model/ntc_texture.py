@@ -8,6 +8,9 @@ The input is a parsed ``.ntc`` file: an object with ``width``, ``height``,
 (layers with raw ``weights``, ``biases`` and ``scales`` bytes). Shaders that import
 ``model.ntc_texture`` need the directory containing ``libntc/shaders`` (the
 NTC SDK ``include`` directory) in the device's compiler include paths.
+
+``NtcTexture`` takes the place of a checkpoint's ``LatentTexture`` for one
+material: it implements the Slang ``ILatentTexture`` interface.
 """
 
 from __future__ import annotations
@@ -22,13 +25,20 @@ MLP_LAYERS = 4
 LAYER_SHAPES = ((48, 64), (64, 48), (48, 32), (32, 16))
 FP8_LAYER_TYPES = ('FloatE4M3', 'FloatE4M3', 'FloatE4M3', 'Int8')
 COLOR_SPACE_CODES = {'Linear': 0, 'sRGB': 1, 'HLG': 2}
-
+NUM_LATENTS = 8
 
 
 class NtcTexture:
+    type_name = 'NtcTexture'
+    slang_module = 'model.ntc_texture'
+    num_channels = NUM_LATENTS
+
     def __init__(self, device: spy.Device, ntc: Any):
+        if ntc.num_channels != NUM_LATENTS:
+            raise ValueError(f'expected {NUM_LATENTS} channels, the file has {ntc.num_channels}')
         self.device = device
         self.num_layers = len(ntc.latents[0].layers)
+        self.num_mip_levels = ntc.num_color_mips
 
         self.latents = self._create_latents(ntc)
         # Matches the latent sampler of the SDK decompression pass: bilinear,

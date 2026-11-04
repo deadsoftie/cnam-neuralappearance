@@ -10,21 +10,27 @@ import model.neural_material_model;
 import rendering.neural_material_globals;
 import util.texture_helpers;
 
-// Runtime material instance for one shading point. It looks up the spatial
-// latent code, then delegates BSDF evaluation and sampling to the trained
-// decoder and sampler stored in the generated config type.
+// Runtime material instance for one shading point. It holds the spatial
+// latent code looked up once in ``setup_material_instance``, then delegates
+// BSDF evaluation and sampling to the trained decoder and sampler stored in
+// the generated config type.
 public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
 {
     int material_id = 0;
     int mip_level = 0;
-    float texel_sample = 0.f;
+    float latents[NeuralMaterialConfig_<HASH>.num_latents];
     uint64_t config_handle = 0xFFFFFFFFFFFFFFFFull;
 
-    __init(int material_id, int mip_level, float texel_sample, uint64_t config_handle)
+    __init(
+        int material_id,
+        int mip_level,
+        float latents[NeuralMaterialConfig_<HASH>.num_latents],
+        uint64_t config_handle
+    )
     {
         this.material_id = material_id;
         this.mip_level = mip_level;
-        this.texel_sample = texel_sample;
+        this.latents = latents;
         this.config_handle = config_handle;
     }
 
@@ -42,7 +48,6 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return float3(0.f);
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
         let result = config.decoder.forward({ material_id, mip_level, latents, wi, wo });
         var f = float3(result[0], result[1], result[2]);
         f = max(f, float3(0.f));
@@ -60,7 +65,6 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return false;
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
         let params = config.sampler.decode_params({ latents, wi });
 
         float3 wo = config.sampler.sample(wi, next_float3(sg), params);
@@ -85,7 +89,6 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return 0.f;
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
         let params = config.sampler.decode_params({ latents, wi });
         return config.sampler.pdf(wi, wo, params);
     }
@@ -141,6 +144,14 @@ public struct NeuralMaterial_<HASH> : IMaterial
         }
         mip_level = max(0, min(mip_level, NeuralMaterialConfig_<HASH>.num_mip_levels - 1));
 
-        return NeuralMaterialInstance_<HASH>(material_id, mip_level, g.texel_sample, config_handle);
+        // One lookup per shading point, shared by eval, sample and eval_pdf.
+        LatentTextureInput input = { material_id, mip_level, si.uv };
+        float latents[NeuralMaterialConfig_<HASH>.num_latents];
+        if (NeuralMaterialConfig_<HASH>.bilinear_latents)
+            latents = config.latents.get_bilinear(input);
+        else
+            latents = config.latents.get_bilinear_stochastic(input, g.texel_sample);
+
+        return NeuralMaterialInstance_<HASH>(material_id, mip_level, latents, config_handle);
     }
 };

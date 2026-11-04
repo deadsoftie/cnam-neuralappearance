@@ -14,6 +14,8 @@ from slangpy.core.native import unpack_arg
 if TYPE_CHECKING:
     from model import NeuralModelCheckpoint
 
+LATENT_FILTERS = ('stochastic', 'bilinear')
+
 
 class NeuralMaterial(f2.Material):
     """Expose a trained neural appearance model as a falcor2 material.
@@ -36,11 +38,16 @@ class NeuralMaterial(f2.Material):
         device: spy.Device,
         neural_model: NeuralModelCheckpoint,
         material_id: int,
+        latent_filter: str = 'stochastic',
     ) -> None:
-        """Compile and bind a neural material for a reference material ID."""
+        """Compile and bind a neural material for a reference material ID.
+
+        ``latent_filter`` selects the latent lookup per shading point:
+        ``stochastic`` (one bilinear neighbor) or ``bilinear`` (blend of 4).
+        """
         self.reference_material_id = int(material_id)
 
-        generated_source = self.code_generate(neural_model)
+        generated_source = self.code_generate(neural_model, latent_filter)
         source_hash = hashlib.sha256(generated_source.encode('utf-8')).hexdigest()[:16]
 
         module_changed = source_hash != self.module_hash
@@ -75,11 +82,20 @@ class NeuralMaterial(f2.Material):
         cursor['material_id'] = self.reference_material_id
         cursor['config_handle'] = f2.to_handle(self.config_tensor.storage).data
 
-    def code_generate(self, neural_model: NeuralModelCheckpoint) -> str:
+    def code_generate(
+        self, neural_model: NeuralModelCheckpoint, latent_filter: str = 'stochastic'
+    ) -> str:
         """Generate concrete Slang aliases for the checkpoint's model types."""
 
+        if latent_filter not in LATENT_FILTERS:
+            raise ValueError(f'latent_filter must be one of {LATENT_FILTERS}, got {latent_filter}')
         latents = neural_model.latent_texture
         decoder = neural_model.decoder
+        if latents.num_mip_levels != neural_model.num_mip_levels:
+            raise ValueError(
+                f'latent texture has {latents.num_mip_levels} mip levels, '
+                f'the model {neural_model.num_mip_levels}'
+            )
 
         if neural_model.sampler is not None:
             sampler_type = neural_model.sampler.type_name
@@ -91,12 +107,16 @@ class NeuralMaterial(f2.Material):
         else:
             aux_type = f'DummyAuxDecoder<{latents.num_channels}, 1>'
 
+        slang_module = getattr(latents, 'slang_module', None)
         return _NEURAL_MATERIAL_CONFIG_TEMPLATE.format(
+            latents_import=f'import {slang_module};' if slang_module else '',
             latents_type=latents.type_name,
             decoder_type=decoder.type_name,
             sampler_type=sampler_type,
             aux_type=aux_type,
             num_mip_levels=neural_model.num_mip_levels,
+            num_latents=latents.num_channels,
+            bilinear_latents='true' if latent_filter == 'bilinear' else 'false',
         )
 
     def _write_config_buffer(
@@ -122,6 +142,7 @@ class NeuralMaterial(f2.Material):
 
 
 _NEURAL_MATERIAL_CONFIG_TEMPLATE = """
+{latents_import}
 public typealias LatentTexture_<HASH> = {latents_type};
 public typealias Decoder_<HASH> = {decoder_type};
 public typealias Sampler_<HASH> = {sampler_type};
@@ -130,6 +151,8 @@ public typealias AuxDecoder_<HASH> = {aux_type};
 public struct NeuralMaterialConfig_<HASH>
 {{
     static const int num_mip_levels = {num_mip_levels};
+    static const int num_latents = {num_latents};
+    static const bool bilinear_latents = {bilinear_latents};
     public LatentTexture_<HASH> latents;
     public Decoder_<HASH> decoder;
     public Sampler_<HASH> sampler;

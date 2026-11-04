@@ -53,6 +53,7 @@ class Renderer:
         self.render_all_udims = rendering_config['all_udims']
         self.render_all_mips = True
         self.format_ext = rendering_config['format']
+        self.latent_filter = rendering_config.get('latent_filter', 'stochastic')
 
         if reference_materials is None or reference_materials.f2_scene is None:
             raise RuntimeError(
@@ -367,7 +368,7 @@ class Renderer:
         if neural_material is None:
             neural_material = self.neural_scene.create_material(NeuralMaterial)
             neural_material.name = f'neural_material_{material.id}'
-            neural_material.configure(self.device, neural_model, material.id)
+            neural_material.configure(self.device, neural_model, material.id, self.latent_filter)
             self._neural_materials[material.id] = neural_material
             self._hit_kernel_key = None
         return neural_material
