@@ -228,7 +228,7 @@ class Trainer:
         if quantize_fp8 or quantize_int8:
             m.ntc_fake_quantize(self.state_fields, half, int(quantize_fp8), spy.grid((NUM_COLUMNS,)))
 
-        self.buffers['grad_mask'].copy_from_numpy(np.zeros((self.total_pixels + 31) // 32, np.uint32))
+        m.ntc_clear_mask(self.state_fields, spy.grid(((self.total_pixels + 31) // 32,)))
         self.sampling['seed'] = self.rng.next_uint32()
         m.ntc_sample(self.sampling, spy.grid((s.batch,)))
 
@@ -251,6 +251,7 @@ class Trainer:
                               adam_constants(s, self.loss_scale, step + 1, grid_lr, self.rng.next_uint32(), 0),
                               spy.grid((self.num_features // 2, self.total_pixels)))
 
+        self.device.wait()
         self.step += 1
         if self.step % s.steps_per_iteration and self.step != s.steps:
             return None

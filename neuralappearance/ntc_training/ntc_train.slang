@@ -443,3 +443,8 @@ void ntc_fake_quantize(NtcTrainState st, int half_offset, int fp8, int col)
         st.weights_q[row + k + 1] = round_half(qy * limit * iscale);
     }
 }
+
+void ntc_clear_mask(NtcTrainState st, int i)
+{
+    st.grad_mask[i] = 0;
+}
