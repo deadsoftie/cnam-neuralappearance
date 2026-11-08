@@ -328,7 +328,7 @@ bool adam(NtcAdam a, float gradient, inout float base, out float quantized, inou
     if (gradient == 0.0)
         return false;
     m1 = a.beta1 * m1 + (1.0 - a.beta1) * gradient;
-    m2 = a.beta2 * m2 + (1.0 - a.beta2) * gradient * gradient;
+    m2 = a.beta2 * m2 + (1.0 - a.beta2) * (gradient * gradient);
     let denom = sqrt(m2) * a.inv_sqrt_bias_correction2 + a.epsilon;
     var w = base - (m1 / denom) * a.step_size;
     var q = round_half(w);
