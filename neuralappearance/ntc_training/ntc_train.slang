@@ -174,28 +174,28 @@ void backward_grid(NtcNetwork net, NtcTrainState st, int n, float u, float v, fl
     }
 }
 
-// Forward, L2 loss against the reference and backward for batch texel ``t``.
-void ntc_train_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t)
+// Forward for batch texel ``t``: layer inputs recorded for the weight gradients,
+// pre-activations returned for the backward pass.
+void forward_texel(NtcNetwork net, NtcTrainState st, int t, out float pre[4][NtcMaxWidth])
 {
     let texel = st.texels[t];
-    let mip = texel.x;
-    let color_mip = net.color_mips[mip];
+    let color_mip = net.color_mips[texel.x];
     let u = (float(texel.y) + 0.5) / float(color_mip.x);
     let v = (float(texel.z) + 0.5) / float(color_mip.y);
 
     float inputs[NtcInputs] = {};
     sample_grid(net, color_mip.z, u, v, 0, inputs);
     sample_grid(net, color_mip.z + 1, u, v, NtcFeaturesPerMip, inputs);
-    let position = net.positions[mip];
+    let position = net.positions[texel.x];
     encode_position(float(texel.y) * position.x, float(texel.z) * position.x, position.y, inputs);
 
     float x[NtcMaxWidth] = {};
     for (int i = 0; i < NtcInputs; ++i)
         x[i] = quantize_input(inputs[i], net.stage, net.one);
 
-    float pre[4][NtcMaxWidth];
     float y[NtcMaxWidth];
     let acts = t * NtcActs;
+    pre = {};
     for (int l = 0; l < 4; ++l)
     {
         for (int k = 0; k < NtcLayerInputs[l]; ++k)
@@ -209,19 +209,22 @@ void ntc_train_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t)
                 x[o] = hgelu_clamp(y[o], int8, net.one);
         }
     }
+}
 
-    float g[NtcMaxWidth] = {};
-    float loss = 0;
-    let ref = st.reference_offsets[mip] + (texel.z * color_mip.x + texel.y) * NtcLatents;
-    for (int c = 0; c < NtcLatents; ++c)
-    {
-        let o = isfinite(pre[3][c]) ? pre[3][c] : 0.0;
-        let diff = round_half(fma(o, net.mapping[c].x, net.mapping[c].y)) - st.reference[ref + c];
-        loss += diff * diff;
-        g[c] = 2.0 * diff * lp.gradient_scale;
-    }
-    st.texel_loss[t] = loss;
+// Linear-space latent ``c`` from the network outputs, as the SDK's loss and decompression.
+float linear_latent(NtcNetwork net, float pre[4][NtcMaxWidth], int c)
+{
+    let o = isfinite(pre[3][c]) ? pre[3][c] : 0.0;
+    return round_half(fma(o, net.mapping[c].x, net.mapping[c].y));
+}
 
+// Backward for batch texel ``t`` from the gradient ``g`` at the network outputs
+// (already scaled by loss scale / batch): records output gradients per layer,
+// adds latent gradients when ``accumulate_latents``.
+void backward_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t, float pre[4][NtcMaxWidth],
+                    float g_out[NtcMaxWidth])
+{
+    var g = g_out;
     let grads = t * NtcGrads;
     for (int l = 3; l >= 0; --l)
     {
@@ -243,12 +246,36 @@ void ntc_train_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t)
 
     if (lp.accumulate_latents != 0)
     {
+        let texel = st.texels[t];
+        let color_mip = net.color_mips[texel.x];
+        let u = (float(texel.y) + 0.5) / float(color_mip.x);
+        let v = (float(texel.z) + 0.5) / float(color_mip.y);
         float grad_inputs[NtcInputs] = {};
         for (int i = 0; i < NtcInputs; ++i)
             grad_inputs[i] = g[i];
         backward_grid(net, st, color_mip.z, u, v, grad_inputs, 0);
         backward_grid(net, st, color_mip.z + 1, u, v, grad_inputs, NtcFeaturesPerMip);
     }
+}
+
+// SDK L2 loss against the reference pyramid for batch texel ``t``. The gradient
+// reaches the outputs without the channel mapping scale, as in the SDK.
+void ntc_train_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t)
+{
+    float pre[4][NtcMaxWidth];
+    forward_texel(net, st, t, pre);
+    let texel = st.texels[t];
+    let ref = st.reference_offsets[texel.x] + (texel.z * net.color_mips[texel.x].x + texel.y) * NtcLatents;
+    float g[NtcMaxWidth] = {};
+    float loss = 0;
+    for (int c = 0; c < NtcLatents; ++c)
+    {
+        let diff = linear_latent(net, pre, c) - st.reference[ref + c];
+        loss += diff * diff;
+        g[c] = 2.0 * diff * lp.gradient_scale;
+    }
+    st.texel_loss[t] = loss;
+    backward_texel(net, st, lp, t, pre, g);
 }
 
 // Partial gradient of parameter ``id.x`` over batch chunk ``id.y``, summed in texel order.

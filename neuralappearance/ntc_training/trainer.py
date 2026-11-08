@@ -5,13 +5,15 @@
 Differences from the SDK: float32 backward, latent gradients summed in 64-bit fixed
 point, latent Adam bias correction with step + 1 (as the network's). The loss is the
 SDK's L2 against a reference pyramid; its gradient reaches the network output without
-the channel mapping scale, as in the SDK.
+the channel mapping scale, as in the SDK. With a ``BsdfLoss`` the loss is the E2E BSDF loss instead,
+on the same texels; its gradient reaches the outputs the same way.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,10 +138,12 @@ class Trainer:
         layers: Sequence[Layer],
         mapping: np.ndarray,
         color_mips: Sequence[ColorMip],
-        reference: Sequence[np.ndarray],
+        reference: Sequence[np.ndarray] | None,
         settings: Settings,
+        bsdf: Any = None,
     ):
-        """``reference``: per color mip, shape (height, width, 8), the dense latent rounded to FP16."""
+        """``reference``: per color mip, shape (height, width, 8), the dense latent rounded to FP16, for the
+        L2 loss. ``bsdf``: a ``BsdfLoss`` for the E2E loss; then ``reference`` is None."""
         if settings.batch % settings.chunk or settings.batch % 32:
             raise ValueError('batch must be a multiple of the chunk and of 32')
         self.device = device
@@ -151,11 +155,18 @@ class Trainer:
         self.neural_mips = neural_mip_table(latents)
         self.grid_shapes = [(lat.shape[2], lat.shape[1]) for lat in latents]
         self.total_pixels = sum(w * h for w, h in self.grid_shapes)
-        if len(reference) != len(color_mips):
-            raise ValueError('one reference image per color mip')
-        for (w, h, *_), ref in zip(color_mips, reference, strict=True):
-            if ref.shape != (h, w, 8):
-                raise ValueError(f'reference of shape {ref.shape}, expected {(h, w, 8)}')
+        if (bsdf is None) == (reference is None):
+            raise ValueError('pass either an L2 reference or a BSDF loss')
+        self.bsdf = bsdf
+        if reference is not None:
+            if len(reference) != len(color_mips):
+                raise ValueError('one reference image per color mip')
+            for (w, h, *_), ref in zip(color_mips, reference, strict=True):
+                if ref.shape != (h, w, 8):
+                    raise ValueError(f'reference of shape {ref.shape}, expected {(h, w, 8)}')
+            reference_values = np.concatenate([np.asarray(r, np.float16).astype(F32).ravel() for r in reference])
+        else:
+            reference_values = np.zeros(1, F32)
 
         lat = flatten_latents(latents)
         weights = np.tile(flatten_layers(layers), 2)
@@ -177,8 +188,7 @@ class Trainer:
             'grads': create_buffer(device, np.zeros(b * 160, F32)),
             'texel_loss': create_buffer(device, np.zeros(b, F32)),
             'partials': create_buffer(device, np.zeros(b // settings.chunk * NUM_PARAMS, F32)),
-            'reference': create_buffer(device, np.concatenate(
-                [np.asarray(r, np.float16).astype(F32).ravel() for r in reference])),
+            'reference': create_buffer(device, reference_values),
         }
         offsets = np.cumsum([0] + [w * h * 8 for w, h, *_ in color_mips])[:-1]
         pixel_offsets = np.cumsum([0] + [w * h for w, h in self.grid_shapes])[:-1]
@@ -235,7 +245,12 @@ class Trainer:
         stage = STAGE_INT8 if quantize_int8 else STAGE_FP8
         loss_params = {'gradient_scale': float(F32(self.loss_scale) / F32(s.batch)),
                        'accumulate_latents': int(step < freeze_step)}
-        m.ntc_train_texel(self.network(stage, half), self.state_fields, loss_params, spy.grid((s.batch,)))
+        network = self.network(stage, half)
+        if self.bsdf is None:
+            m.ntc_train_texel(network, self.state_fields, loss_params, spy.grid((s.batch,)))
+        else:
+            self.bsdf.prepare(network, self.state_fields)
+            self.bsdf.train(network, self.state_fields, loss_params)
         m.ntc_weight_chunk(self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
         m.ntc_weight_sum(self.state_fields, spy.grid((NUM_PARAMS,)))
 
@@ -256,7 +271,8 @@ class Trainer:
         if self.step % s.steps_per_iteration and self.step != s.steps:
             return None
         loss = float(self.buffers['texel_loss'].to_numpy().view(F32).astype(np.float64).sum()) / s.batch
-        return float(F32(loss) / F32(s.valid_channels))
+        divisor = s.valid_channels if self.bsdf is None else self.bsdf.loss_divisor
+        return float(F32(loss) / F32(divisor))
 
     def run(self, on_iteration: Callable[[Iteration], None] | None = None) -> list[Iteration]:
         start = time.perf_counter()
