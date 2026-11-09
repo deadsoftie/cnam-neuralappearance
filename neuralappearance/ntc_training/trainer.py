@@ -3,7 +3,8 @@
 """NTC grid and decode network training, step for step as ``TextureSet::RunCompressionSteps``.
 
 Differences from the SDK: float32 backward, latent gradients summed in 64-bit fixed
-point, latent Adam bias correction with step + 1 (as the network's). The loss is the
+point, latent Adam bias correction with step + 1 (as the network's). Every dispatch waits for
+the device before the next: without the waits E2E runs diverge after a few dozen steps. The loss is the
 SDK's L2 against a reference pyramid; its gradient reaches the network output without
 the channel mapping scale, as in the SDK. With a ``BsdfLoss`` the loss is the E2E BSDF loss instead,
 on the same texels; its gradient reaches the outputs the same way.
@@ -222,6 +223,10 @@ class Trainer:
         steps = F32(self.s.steps)
         return int(steps * FREEZE_RATIO), int(steps * FP8_RATIO), int(steps * INT8_RATIO)
 
+    def dispatch(self, kernel, *args) -> None:
+        kernel(*args)
+        self.device.wait()
+
     def run_step(self) -> float | None:
         """One training step. Returns the loss when it is the last step of an iteration."""
         s, m, step = self.s, self.module, self.step
@@ -236,37 +241,36 @@ class Trainer:
                 values[NUM_PARAMS:] = values[:NUM_PARAMS]
                 self.buffers[name].copy_from_numpy(values)
         if quantize_fp8 or quantize_int8:
-            m.ntc_fake_quantize(self.state_fields, half, int(quantize_fp8), spy.grid((NUM_COLUMNS,)))
+            self.dispatch(m.ntc_fake_quantize, self.state_fields, half, int(quantize_fp8), spy.grid((NUM_COLUMNS,)))
 
-        m.ntc_clear_mask(self.state_fields, spy.grid(((self.total_pixels + 31) // 32,)))
+        self.dispatch(m.ntc_clear_mask, self.state_fields, spy.grid(((self.total_pixels + 31) // 32,)))
         self.sampling['seed'] = self.rng.next_uint32()
-        m.ntc_sample(self.sampling, spy.grid((s.batch,)))
+        self.dispatch(m.ntc_sample, self.sampling, spy.grid((s.batch,)))
 
         stage = STAGE_INT8 if quantize_int8 else STAGE_FP8
         loss_params = {'gradient_scale': float(F32(self.loss_scale) / F32(s.batch)),
                        'accumulate_latents': int(step < freeze_step)}
         network = self.network(stage, half)
         if self.bsdf is None:
-            m.ntc_train_texel(network, self.state_fields, loss_params, spy.grid((s.batch,)))
+            self.dispatch(m.ntc_train_texel, network, self.state_fields, loss_params, spy.grid((s.batch,)))
         else:
             self.bsdf.prepare(network, self.state_fields)
             self.bsdf.train(network, self.state_fields, loss_params)
-        m.ntc_weight_chunk(self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
-        m.ntc_weight_sum(self.state_fields, spy.grid((NUM_PARAMS,)))
+        self.dispatch(m.ntc_weight_chunk, self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
+        self.dispatch(m.ntc_weight_sum, self.state_fields, spy.grid((NUM_PARAMS,)))
 
         network_lr = cosine(step, s.network_learning_rate, s.steps)
-        m.ntc_network_adam(self.state_fields,
-                           adam_constants(s, self.loss_scale, step + 1, network_lr, self.rng.next_uint32(), half),
-                           spy.grid((NUM_PARAMS,)))
+        self.dispatch(m.ntc_network_adam, self.state_fields,
+                      adam_constants(s, self.loss_scale, step + 1, network_lr, self.rng.next_uint32(), half),
+                      spy.grid((NUM_PARAMS,)))
         if step == freeze_step:
-            m.ntc_freeze(self.state_fields, spy.grid((self.total_pixels * self.num_features,)))
+            self.dispatch(m.ntc_freeze, self.state_fields, spy.grid((self.total_pixels * self.num_features,)))
         elif step < freeze_step:
             grid_lr = cosine(step, s.grid_learning_rate, s.steps)
-            m.ntc_latent_adam(self.network(stage, half), self.state_fields,
-                              adam_constants(s, self.loss_scale, step + 1, grid_lr, self.rng.next_uint32(), 0),
-                              spy.grid((self.num_features // 2, self.total_pixels)))
+            self.dispatch(m.ntc_latent_adam, self.network(stage, half), self.state_fields,
+                          adam_constants(s, self.loss_scale, step + 1, grid_lr, self.rng.next_uint32(), 0),
+                          spy.grid((self.num_features // 2, self.total_pixels)))
 
-        self.device.wait()
         self.step += 1
         if self.step % s.steps_per_iteration and self.step != s.steps:
             return None

@@ -44,18 +44,24 @@ class BsdfLoss:
             device, np.array([self.material.texture_resolution], np.int32))
         self.loss_function = LossFunction(config['training']['loss_function'], TrainingTargets('bsdf'))
         self.decoder = decoder
+        self.device = device
         self.module = spy.Module.load_from_file(device, str(MODULE))
 
     def prepare(self, network: dict, state: dict) -> None:
-        """Fill the BSDF samples for the texels of the current batch."""
+        """Fill the BSDF samples for the texels of the current batch. Waits after each dispatch, as the
+        trainer does."""
         sg = self.generator.sample_generator
         self.module.ntc_bsdf_samples(network, state, self.datagen_config, self.material.id, self.material.backend_id,
                                      spy.call_id(), sg, self.samples)
+        self.device.wait()
         self.generator.fill_importance_sampled_wo_kernel(
             config=self.datagen_config, texture_resolution=self.texture_resolution, sg=sg, sample=self.samples)
+        self.device.wait()
         self.generator.fill_target_kernel(
             config=self.datagen_config, texture_resolution=self.texture_resolution, sg=sg, sample=self.samples)
+        self.device.wait()
 
     def train(self, network: dict, state: dict, loss_params: dict) -> None:
         self.module.ntc_train_texel_bsdf(network, state, loss_params, self.decoder, self.samples, self.loss_function,
                                          spy.call_id())
+        self.device.wait()
