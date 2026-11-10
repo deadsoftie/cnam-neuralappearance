@@ -49,6 +49,7 @@ float bsdf_loss<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction : ILossFunc
 }
 
 // Forward, 7.1 loss through the frozen decoder and backward for batch texel ``call_id.x``.
+// ``control_variate``: subtract the gradient at the dense latents in ``st.reference``.
 void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction : ILossFunction<3>>(
     NtcNetwork net,
     NtcTrainState st,
@@ -56,6 +57,7 @@ void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction :
     BsdfDecoder decoder,
     TrainingSample<3, 1> sample,
     LossFunction loss_function,
+    int control_variate,
     int2 call_id)
 {
     NeuralConfig::set_batch_index(0);
@@ -74,6 +76,21 @@ void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction :
     float g[NtcMaxWidth] = {};
     for (int c = 0; c < NtcLatents; ++c)
         g[c] = pair.d[c] * lp.gradient_scale;
+
+    // Control variate: the dense latents minimize this loss, so their gradient on the
+    // same sample has expectation zero and carries most of the direction noise.
+    if (control_variate != 0)
+    {
+        let texel = st.texels[t];
+        let ref = st.reference_offsets[texel.x] + (texel.z * net.color_mips[texel.x].x + texel.y) * NtcLatents;
+        float dense[NtcLatents];
+        for (int c = 0; c < NtcLatents; ++c)
+            dense[c] = st.reference[ref + c];
+        var dense_pair = diffPair(dense);
+        bwd_diff(bsdf_loss<BsdfDecoder, LossFunction>)(decoder, dense_pair, sample, loss_function, 1.f);
+        for (int c = 0; c < NtcLatents; ++c)
+            g[c] -= dense_pair.d[c] * lp.gradient_scale;
+    }
     backward_texel(net, st, lp, t, pre, g);
 }
 

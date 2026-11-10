@@ -115,7 +115,8 @@ def network_uniforms(
 
 def create_buffer(device: spy.Device, data: np.ndarray) -> spy.Buffer:
     return device.create_buffer(
-        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+        usage=(spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access | spy.BufferUsage.copy_source
+               | spy.BufferUsage.copy_destination),
         data=np.ascontiguousarray(data),
     )
 

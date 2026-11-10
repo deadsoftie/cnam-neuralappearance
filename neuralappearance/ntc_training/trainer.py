@@ -3,11 +3,14 @@
 """NTC grid and decode network training, step for step as ``TextureSet::RunCompressionSteps``.
 
 Differences from the SDK: float32 backward, latent gradients summed in 64-bit fixed
-point, latent Adam bias correction with step + 1 (as the network's). Every dispatch waits for
-the device before the next: without the waits E2E runs diverge after a few dozen steps. The loss is the
-SDK's L2 against a reference pyramid; its gradient reaches the network output without
-the channel mapping scale, as in the SDK. With a ``BsdfLoss`` the loss is the E2E BSDF loss instead,
-on the same texels; its gradient reaches the outputs the same way.
+point, latent Adam bias correction with step + 1 (as the network's). Steps are recorded as RTNAM
+records them: a block of steps per command buffer with a global barrier after each kernel, several
+blocks queued, the device waited for only at the end of an iteration, where the loss read back
+asynchronously sets the next loss scale. The loss is the SDK's L2 against a reference pyramid; its
+gradient reaches the network output without the channel mapping scale, as in the SDK. With a
+``BsdfLoss`` the loss is the E2E BSDF loss instead, on the same texels; its gradient reaches the
+outputs the same way, minus the gradient at the reference pyramid when one is given (control
+variate).
 """
 
 from __future__ import annotations
@@ -59,6 +62,8 @@ class Settings:
     epsilon: float = 1e-8
     chunk: int = 256
     valid_channels: int = 8
+    block_steps: int = 16
+    blocks_in_flight: int = 8
 
 
 @dataclass
@@ -143,8 +148,9 @@ class Trainer:
         settings: Settings,
         bsdf: Any = None,
     ):
-        """``reference``: per color mip, shape (height, width, 8), the dense latent rounded to FP16, for the
-        L2 loss. ``bsdf``: a ``BsdfLoss`` for the E2E loss; then ``reference`` is None."""
+        """``reference``: per color mip, shape (height, width, 8), the dense latent. The L2 loss uses it
+        rounded to FP16; a ``bsdf`` (E2E loss) uses it as given as control variate, or runs without one when
+        it is None."""
         if settings.batch % settings.chunk or settings.batch % 32:
             raise ValueError('batch must be a multiple of the chunk and of 32')
         self.device = device
@@ -156,16 +162,19 @@ class Trainer:
         self.neural_mips = neural_mip_table(latents)
         self.grid_shapes = [(lat.shape[2], lat.shape[1]) for lat in latents]
         self.total_pixels = sum(w * h for w, h in self.grid_shapes)
-        if (bsdf is None) == (reference is None):
-            raise ValueError('pass either an L2 reference or a BSDF loss')
+        if bsdf is None and reference is None:
+            raise ValueError('the L2 loss needs a reference')
         self.bsdf = bsdf
+        self.control_variate = bsdf is not None and reference is not None
+        self.encoder = None
         if reference is not None:
             if len(reference) != len(color_mips):
                 raise ValueError('one reference image per color mip')
             for (w, h, *_), ref in zip(color_mips, reference, strict=True):
                 if ref.shape != (h, w, 8):
                     raise ValueError(f'reference of shape {ref.shape}, expected {(h, w, 8)}')
-            reference_values = np.concatenate([np.asarray(r, np.float16).astype(F32).ravel() for r in reference])
+            dtype = np.float16 if bsdf is None else F32
+            reference_values = np.concatenate([np.asarray(r, dtype).astype(F32).ravel() for r in reference])
         else:
             reference_values = np.zeros(1, F32)
 
@@ -210,6 +219,10 @@ class Trainer:
             'height': color_mips[0][1],
             'seed': 0,
         }
+        self.loss_readback = device.create_buffer(size=b * 4, usage=spy.BufferUsage.copy_destination,
+                                                  memory_type=spy.MemoryType.read_back)
+        self.fence = device.create_fence(0)
+        self.fence_value = 0
         self.rng = sdk_rng.Mt19937(settings.seed)
         self.step = 0
         self.loss_scale = 256.0
@@ -223,13 +236,23 @@ class Trainer:
         steps = F32(self.s.steps)
         return int(steps * FREEZE_RATIO), int(steps * FP8_RATIO), int(steps * INT8_RATIO)
 
-    def dispatch(self, kernel, *args) -> None:
-        kernel(*args)
-        self.device.wait()
+    def dispatch(self, kernel, *args, **kwargs) -> None:
+        """While steps are recorded, appends to their command buffer, else runs and waits."""
+        if self.encoder is None:
+            kernel(*args, **kwargs)
+            self.device.wait()
+            return
+        kernel.append_to(self.encoder, *args, **kwargs)
+        self.encoder.global_barrier()
 
-    def run_step(self) -> float | None:
-        """One training step. Returns the loss when it is the last step of an iteration."""
-        s, m, step = self.s, self.module, self.step
+    def iteration_end(self) -> int:
+        """Step count at the end of the iteration the next step belongs to."""
+        return min((self.step // self.s.steps_per_iteration + 1) * self.s.steps_per_iteration, self.s.steps)
+
+    def record_step(self) -> None:
+        """Records the next step into ``self.encoder`` and advances the host state. At the end of an iteration
+        also copies the step's texel losses for ``read_loss``."""
+        s, m, step, end = self.s, self.module, self.step, self.iteration_end()
         freeze_step, fp8_step, int8_step = self.schedule()
         quantize_fp8 = fp8_step < step <= int8_step
         quantize_int8 = step > int8_step
@@ -237,9 +260,8 @@ class Trainer:
 
         if step == fp8_step:
             for name in ('weights_base', 'weights_q'):
-                values = self.buffers[name].to_numpy().view(F32)
-                values[NUM_PARAMS:] = values[:NUM_PARAMS]
-                self.buffers[name].copy_from_numpy(values)
+                self.encoder.copy_buffer(self.buffers[name], NUM_PARAMS * 4, self.buffers[name], 0, NUM_PARAMS * 4)
+            self.encoder.global_barrier()
         if quantize_fp8 or quantize_int8:
             self.dispatch(m.ntc_fake_quantize, self.state_fields, half, int(quantize_fp8), spy.grid((NUM_COLUMNS,)))
 
@@ -254,8 +276,8 @@ class Trainer:
         if self.bsdf is None:
             self.dispatch(m.ntc_train_texel, network, self.state_fields, loss_params, spy.grid((s.batch,)))
         else:
-            self.bsdf.prepare(network, self.state_fields)
-            self.bsdf.train(network, self.state_fields, loss_params)
+            self.bsdf.prepare(network, self.state_fields, self.dispatch)
+            self.bsdf.train(network, self.state_fields, loss_params, self.control_variate, self.dispatch)
         self.dispatch(m.ntc_weight_chunk, self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
         self.dispatch(m.ntc_weight_sum, self.state_fields, spy.grid((NUM_PARAMS,)))
 
@@ -272,26 +294,58 @@ class Trainer:
                           spy.grid((self.num_features // 2, self.total_pixels)))
 
         self.step += 1
-        if self.step % s.steps_per_iteration and self.step != s.steps:
-            return None
-        loss = float(self.buffers['texel_loss'].to_numpy().view(F32).astype(np.float64).sum()) / s.batch
-        divisor = s.valid_channels if self.bsdf is None else self.bsdf.loss_divisor
+        if self.step == end:
+            self.encoder.copy_buffer(self.loss_readback, 0, self.buffers['texel_loss'], 0, self.loss_readback.size)
+
+    def read_loss(self) -> float:
+        """Loss of the last step of the last finished iteration; the device must have finished it."""
+        loss = float(self.loss_readback.to_numpy().view(F32).astype(np.float64).sum()) / self.s.batch
+        divisor = self.s.valid_channels if self.bsdf is None else self.bsdf.loss_divisor
         return float(F32(loss) / F32(divisor))
 
+    def submit(self, steps: int) -> int:
+        """Records ``steps`` steps into one command buffer and submits it. Returns its fence value."""
+        self.encoder = self.device.create_command_encoder()
+        try:
+            for _ in range(steps):
+                self.record_step()
+        finally:
+            encoder, self.encoder = self.encoder, None
+        self.fence_value += 1
+        self.device.submit_command_buffers([encoder.finish()], signal_fences=[self.fence],
+                                           signal_fence_values=[self.fence_value])
+        return self.fence_value
+
+    def run_step(self) -> float | None:
+        """One training step, waited for. Returns the loss when it is the last step of an iteration."""
+        end = self.iteration_end()
+        self.fence.wait(self.submit(1))
+        return self.read_loss() if self.step == end else None
+
+    def update_loss_scale(self, loss: float) -> None:
+        """SDK loss scale for the next iteration from the loss of the last one."""
+        self.loss_scale = float(min(F32(32768), F32(128) / np.sqrt(F32(loss)))) if loss > 0 else 32768.0
+
+    def finish_iteration(self, start: float, steps: int, on_iteration: Callable[[Iteration], None] | None) -> None:
+        loss = self.read_loss()
+        item = Iteration(self.step, loss, self.loss_scale, (time.perf_counter() - start) * 1000 / steps)
+        self.update_loss_scale(loss)
+        self.history.append(item)
+        if on_iteration:
+            on_iteration(item)
+
     def run(self, on_iteration: Callable[[Iteration], None] | None = None) -> list[Iteration]:
-        start = time.perf_counter()
+        """Steps in blocks of ``block_steps`` per command buffer, up to ``blocks_in_flight`` queued; the device
+        is waited for only at the end of each iteration, where the loss scale changes."""
         while self.step < self.s.steps:
-            loss = self.run_step()
-            if loss is None:
-                continue
-            self.device.wait()
-            elapsed = time.perf_counter() - start
-            item = Iteration(self.step, loss, self.loss_scale, elapsed * 1000 / self.s.steps_per_iteration)
-            self.loss_scale = float(min(F32(32768), F32(128) / np.sqrt(F32(loss)))) if loss > 0 else 32768.0
-            self.history.append(item)
-            if on_iteration:
-                on_iteration(item)
-            start = time.perf_counter()
+            start, first, end = time.perf_counter(), self.step, self.iteration_end()
+            in_flight: list[int] = []
+            while self.step < end:
+                if len(in_flight) == self.s.blocks_in_flight:
+                    self.fence.wait(in_flight.pop(0))
+                in_flight.append(self.submit(min(self.s.block_steps, end - self.step)))
+            self.fence.wait(in_flight[-1])
+            self.finish_iteration(start, end - first, on_iteration)
         return self.history
 
     def latents(self) -> list[np.ndarray]:
