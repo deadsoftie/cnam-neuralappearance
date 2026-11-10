@@ -2,15 +2,16 @@
 
 """NTC grid and decode network training, step for step as ``TextureSet::RunCompressionSteps``.
 
-Differences from the SDK: float32 backward, latent gradients summed in 64-bit fixed
-point, latent Adam bias correction with step + 1 (as the network's). Steps are recorded as RTNAM
-records them: a block of steps per command buffer with a global barrier after each kernel, several
-blocks queued, the device waited for only at the end of an iteration, where the loss read back
-asynchronously sets the next loss scale. The loss is the SDK's L2 against a reference pyramid; its
-gradient reaches the network output without the channel mapping scale, as in the SDK. With a
-``BsdfLoss`` the loss is the E2E BSDF loss instead, on the same texels; its gradient reaches the
-outputs the same way, minus the gradient at the reference pyramid when one is given (control
-variate).
+Differences from the SDK: matrix products on cooperative vectors (FP16 as the SDK's tensor cores,
+rounding inside the hardware), weight gradients reduced per warp, then in a fixed order, latent
+gradients summed in 64-bit fixed point, latent Adam bias correction with step + 1 (as the
+network's). Steps are recorded as RTNAM records them: a block of steps per command buffer with a
+global barrier after each kernel, several blocks queued, the device waited for only at the end of an
+iteration, where the loss read back asynchronously sets the next loss scale. The loss is the SDK's
+L2 against a reference pyramid; its gradient reaches the network output without the channel mapping
+scale, as in the SDK. With a ``BsdfLoss`` the loss is the E2E BSDF loss instead, on the same texels;
+its gradient reaches the outputs the same way, minus the gradient at the reference pyramid when one
+is given (control variate).
 """
 
 from __future__ import annotations
@@ -26,10 +27,12 @@ import slangpy as spy
 
 from ntc_training import sdk_rng
 from ntc_training.ntc_forward import (
+    BIAS_OFFSETS,
     LAYER_SHAPES,
     NUM_PARAMS,
     STAGE_FP8,
     STAGE_INT8,
+    WEIGHT_OFFSETS,
     ColorMip,
     Layer,
     check_inputs,
@@ -44,6 +47,8 @@ from ntc_training.ntc_forward import (
 MODULE = Path(__file__).with_name('ntc_train.slang')
 F32 = np.float32
 NUM_COLUMNS = sum(o for _, o in LAYER_SHAPES)
+NUM_WEIGHTS = BIAS_OFFSETS[0]
+COOP_ALIGNMENT = 64
 FREEZE_RATIO = F32(0.95)
 FP8_RATIO = F32(0.96)
 INT8_RATIO = F32(0.98)
@@ -114,6 +119,61 @@ def mma_offsets(rows: int, cols: int) -> np.ndarray:
     mma_idx = (c // 16) * (rows // 16) + rp // 8
     sub_r, sub_c = rp % 8, c % 16
     return ((32 * mma_idx + (sub_c % 8) * 4 + sub_r % 4) * 4 + (sub_c // 8) * 2 + sub_r // 4) * 2 + r % 2
+
+
+def aligned(n: int) -> int:
+    return (n + COOP_ALIGNMENT - 1) // COOP_ALIGNMENT * COOP_ALIGNMENT
+
+
+class CoopLayout:
+    """FP16 training-optimal matrices of the four layers, then the bias vectors. ``index[p]``: FP16
+    index of parameter ``p`` (``weights_q`` order) in a gradient slot."""
+
+    def __init__(self, device: spy.Device):
+        layout, half = spy.CoopVecMatrixLayout.training_optimal, spy.DataType.float16
+        self.matrices, self.weight_offsets, start = [], [], 0
+        for n_in, n_out in LAYER_SHAPES:
+            desc = device.create_coop_vec_matrix_desc(n_out, n_in, layout, half, start)
+            self.matrices.append(desc)
+            self.weight_offsets.append(start)
+            start = aligned(start + desc.size)
+        self.weights_bytes = start
+        self.bias_offsets = [2 * (o - BIAS_OFFSETS[0]) for o in BIAS_OFFSETS]
+        self.biases_bytes = 2 * (NUM_PARAMS - NUM_WEIGHTS)
+        self.slot_bytes = aligned(self.weights_bytes + self.biases_bytes)
+        self.index = np.empty(NUM_PARAMS, np.int32)
+        for l, (n_in, n_out) in enumerate(LAYER_SHAPES):
+            rows = self.to_layout(device, l, np.repeat(np.arange(1, n_out + 1)[:, None], n_in, 1))
+            cols = self.to_layout(device, l, np.repeat(np.arange(1, n_in + 1)[None, :], n_out, 0))
+            at = np.nonzero(rows)[0]
+            flat = (rows[at] - 1) * n_in + cols[at] - 1
+            if not np.array_equal(np.sort(flat), np.arange(n_in * n_out)):
+                raise RuntimeError(f'layer {l}: training-optimal layout does not hold every weight once')
+            self.index[WEIGHT_OFFSETS[l] + flat] = self.weight_offsets[l] // 2 + at
+            biases = np.arange(n_out)
+            self.index[BIAS_OFFSETS[l] + biases] = (self.weights_bytes + self.bias_offsets[l]) // 2 + biases
+
+    def source(self, layer: int, start: int) -> spy.CoopVecMatrixDesc:
+        """Row-major FP32 matrix of ``layer`` in a parameter buffer whose weight set begins at ``start``."""
+        n_in, n_out = LAYER_SHAPES[layer]
+        return spy.CoopVecMatrixDesc({'rows': n_out, 'cols': n_in, 'layout': spy.CoopVecMatrixLayout.row_major,
+                                      'element_type': spy.DataType.float32, 'size': n_in * n_out * 4,
+                                      'offset': (start + WEIGHT_OFFSETS[layer]) * 4, 'row_col_stride': n_in * 4})
+
+    def to_layout(self, device: spy.Device, layer: int, values: np.ndarray) -> np.ndarray:
+        """Small integers of a row-major matrix, read back in the layer's training-optimal order."""
+        src = device.create_buffer(usage=spy.BufferUsage.shader_resource,
+                                   data=np.ascontiguousarray(values, F32).ravel())
+        dst_desc = self.matrices[layer]
+        dst = device.create_buffer(size=dst_desc.offset + dst_desc.size,
+                                   usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
+        encoder = device.create_command_encoder()
+        encoder.clear_buffer(dst)
+        encoder.convert_coop_vec_matrix(dst, dst_desc, src, self.source(layer, -WEIGHT_OFFSETS[layer]))
+        device.submit_command_buffer(encoder.finish())
+        device.wait()
+        out = dst.to_numpy().view(np.float16)[dst_desc.offset // 2:]
+        return np.rint(out.astype(F32)).astype(np.int64)
 
 
 def sdk_initial_state(grid_shapes: Sequence[tuple[int, int]], num_features: int,
@@ -194,16 +254,28 @@ class Trainer:
             'weight_m2': create_buffer(device, np.zeros(NUM_PARAMS, F32)),
             'weight_grad': create_buffer(device, np.zeros(NUM_PARAMS, F32)),
             'texels': create_buffer(device, np.zeros((b, 4), np.int32)),
-            'acts': create_buffer(device, np.zeros(b * 192, F32)),
-            'grads': create_buffer(device, np.zeros(b * 160, F32)),
+            'output_grads': create_buffer(device, np.zeros(b * 16, F32)),
             'texel_loss': create_buffer(device, np.zeros(b, F32)),
             'partials': create_buffer(device, np.zeros(b // settings.chunk * NUM_PARAMS, F32)),
             'reference': create_buffer(device, reference_values),
+        }
+        self.coop = CoopLayout(device)
+        coop_usage = (spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access
+                      | spy.BufferUsage.copy_destination)
+        self.buffers |= {
+            'coop_weights': device.create_buffer(size=self.coop.weights_bytes, usage=coop_usage),
+            'coop_biases': device.create_buffer(size=self.coop.biases_bytes, usage=coop_usage),
+            'grad_slots': device.create_buffer(size=b // 32 * self.coop.slot_bytes, usage=coop_usage),
+            'slot_index': create_buffer(device, self.coop.index),
         }
         offsets = np.cumsum([0] + [w * h * 8 for w, h, *_ in color_mips])[:-1]
         pixel_offsets = np.cumsum([0] + [w * h for w, h in self.grid_shapes])[:-1]
         self.state_fields = {
             **self.buffers,
+            'coop_weight_offsets': spy.int4(*self.coop.weight_offsets),
+            'coop_bias_offsets': spy.int4(*self.coop.bias_offsets),
+            'slot_bytes': self.coop.slot_bytes,
+            'slot_bias_start': self.coop.weights_bytes,
             'reference_offsets': [int(v) for v in offsets] + [0] * (16 - len(offsets)),
             'pixel_offsets': [int(v) for v in pixel_offsets] + [0] * (8 - len(pixel_offsets)),
             'num_neural_mips': len(self.grid_shapes),
@@ -245,6 +317,25 @@ class Trainer:
         kernel.append_to(self.encoder, *args, **kwargs)
         self.encoder.global_barrier()
 
+    def prepare_network(self, half: int) -> None:
+        """The weight set from ``half`` in FP16 for the cooperative-vector kernels, gradient slots cleared.
+        Records while steps are recorded, else runs and waits."""
+        standalone = self.encoder is None
+        if standalone:
+            self.encoder = self.device.create_command_encoder()
+        try:
+            self.encoder.convert_coop_vec_matrices(self.buffers['coop_weights'], self.coop.matrices,
+                                                   self.buffers['weights_q'],
+                                                   [self.coop.source(l, half) for l in range(len(LAYER_SHAPES))])
+            self.encoder.clear_buffer(self.buffers['grad_slots'])
+            self.dispatch(self.module.ntc_pack_biases, self.state_fields, half, self.buffers['coop_biases'],
+                          spy.grid(((NUM_PARAMS - NUM_WEIGHTS) // 2,)))
+        finally:
+            if standalone:
+                encoder, self.encoder = self.encoder, None
+                self.device.submit_command_buffer(encoder.finish())
+                self.device.wait()
+
     def iteration_end(self) -> int:
         """Step count at the end of the iteration the next step belongs to."""
         return min((self.step // self.s.steps_per_iteration + 1) * self.s.steps_per_iteration, self.s.steps)
@@ -264,6 +355,7 @@ class Trainer:
             self.encoder.global_barrier()
         if quantize_fp8 or quantize_int8:
             self.dispatch(m.ntc_fake_quantize, self.state_fields, half, int(quantize_fp8), spy.grid((NUM_COLUMNS,)))
+        self.prepare_network(half)
 
         self.dispatch(m.ntc_clear_mask, self.state_fields, spy.grid(((self.total_pixels + 31) // 32,)))
         self.sampling['seed'] = self.rng.next_uint32()

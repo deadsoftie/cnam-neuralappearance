@@ -62,18 +62,17 @@ void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction :
 {
     NeuralConfig::set_batch_index(0);
     let t = call_id.x;
-    float pre[4][NtcMaxWidth];
-    forward_texel(net, st, t, pre);
+    let f = forward_texel(net, st, t);
 
     float latents[NtcLatents];
     for (int c = 0; c < NtcLatents; ++c)
-        latents[c] = linear_latent(net, pre, c);
+        latents[c] = linear_latent(net, float(f.y3[c]), c);
     st.texel_loss[t] = bsdf_loss(decoder, latents, sample, loss_function);
 
     var pair = diffPair(latents);
     bwd_diff(bsdf_loss<BsdfDecoder, LossFunction>)(decoder, pair, sample, loss_function, 1.f);
 
-    float g[NtcMaxWidth] = {};
+    float g[NtcOutputs] = {};
     for (int c = 0; c < NtcLatents; ++c)
         g[c] = pair.d[c] * lp.gradient_scale;
 
@@ -91,7 +90,7 @@ void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction :
         for (int c = 0; c < NtcLatents; ++c)
             g[c] -= dense_pair.d[c] * lp.gradient_scale;
     }
-    backward_texel(net, st, lp, t, pre, g);
+    backward_texel(net, st, lp, t, f, g);
 }
 
 // Loss of the frozen decoder at given latents, for gradient checks.
@@ -124,14 +123,4 @@ void ntc_bsdf_sample_fields(TrainingSample<3, 1> sample, out float4 uv_mip_valid
     wi = sample.wi;
     wo = sample.wo;
     target = float3(sample.target[0], sample.target[1], sample.target[2]);
-}
-
-float[NtcLatents] ntc_linear_latents(NtcNetwork net, NtcTrainState st, int t)
-{
-    float pre[4][NtcMaxWidth];
-    forward_texel(net, st, t, pre);
-    float latents[NtcLatents];
-    for (int c = 0; c < NtcLatents; ++c)
-        latents[c] = linear_latent(net, pre, c);
-    return latents;
 }

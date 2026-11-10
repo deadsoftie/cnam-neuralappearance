@@ -2,21 +2,20 @@
 
 // One training step of the NTC SDK compression (``TextureSet.cpp``,
 // ``RegressionKernels.h``, ``Optimizer.cu``, ``Quantizer.cu``) as separate
-// kernels. Forward as ``ntc_forward.slang``; backward in float32 with
-// straight-through quantization. Weight gradients are summed in texel order;
-// latent gradients are summed as 64-bit fixed point (``LatentGradScale``), so
-// every reduction is independent of thread order.
+// kernels. The network runs on cooperative vectors (tensor cores) in FP16 as the
+// SDK's ``tin`` MLP: inputs, encoding, activations and quantization as
+// ``ntc_forward.slang``, matrix products in hardware, backward in FP16 with
+// straight-through quantization. Each warp accumulates its weight gradients into
+// its own slot; slots are summed in a fixed order. Latent gradients are summed as
+// 64-bit fixed point (``LatentGradScale``). Every reduction is independent of
+// thread order.
 import slangpy;
 __exported import ntc_training.ntc_forward;
 
 static const int NtcParams = 8352;
 static const int NtcBiasStart = 8192;
-static const int NtcActs = 192;
-static const int NtcGrads = 160;
 static const int NtcLayerWeightOffsets[4] = { 0, 3072, 6144, 7680 };
 static const int NtcLayerBiasOffsets[4] = { 8192, 8256, 8304, 8336 };
-static const int NtcActOffsets[4] = { 0, 48, 112, 160 };
-static const int NtcGradOffsets[4] = { 0, 64, 112, 144 };
 static const float LatentGradScale = 1099511627776.0; // 2^40
 static const float LatentStep = 1.0 / 15.0;
 
@@ -112,11 +111,18 @@ struct NtcTrainState
     RWStructuredBuffer<float> weight_m2;
     RWStructuredBuffer<float> weight_grad;
     RWStructuredBuffer<int4> texels;
-    RWStructuredBuffer<float> acts;
-    RWStructuredBuffer<float> grads;
+    RWStructuredBuffer<float> output_grads; // per texel, the gradient at the network outputs
     RWStructuredBuffer<float> texel_loss;
     RWStructuredBuffer<float> partials;
     StructuredBuffer<float> reference;  // per color mip, 8 channels per texel
+    ByteAddressBuffer coop_weights;     // FP16 matrices in the training-optimal layout
+    ByteAddressBuffer coop_biases;      // FP16 bias vectors
+    RWByteAddressBuffer grad_slots;     // per warp: weight gradients as ``coop_weights``, then biases
+    StructuredBuffer<int> slot_index;   // per parameter, its FP16 index in a slot
+    int4 coop_weight_offsets;           // bytes, in ``coop_weights`` and in a slot
+    int4 coop_bias_offsets;             // bytes, in ``coop_biases`` and after ``slot_bias_start``
+    int slot_bytes;
+    int slot_bias_start;
     int reference_offsets[16];
     int pixel_offsets[8];               // first pixel of each neural mip, SDK order
     int num_neural_mips;
@@ -174,9 +180,55 @@ void backward_grid(NtcNetwork net, NtcTrainState st, int n, float u, float v, fl
     }
 }
 
-// Forward for batch texel ``t``: layer inputs recorded for the weight gradients,
-// pre-activations returned for the backward pass.
-void forward_texel(NtcNetwork net, NtcTrainState st, int t, out float pre[4][NtcMaxWidth])
+struct NtcTrainForward
+{
+    CoopVec<half, 48> x0;
+    CoopVec<half, 64> y0;
+    CoopVec<half, 64> x1;
+    CoopVec<half, 48> y1;
+    CoopVec<half, 48> x2;
+    CoopVec<half, 32> y2;
+    CoopVec<half, 32> x3;
+    CoopVec<half, 16> y3;
+}
+
+CoopVec<half, N> layer_forward<let K : int, let N : int>(NtcTrainState st, int l, CoopVec<half, K> x)
+{
+    return coopVecMatMulAdd<half, N>(x, CoopVecComponentType.Float16, st.coop_weights, st.coop_weight_offsets[l],
+                                     CoopVecComponentType.Float16, st.coop_biases, st.coop_bias_offsets[l],
+                                     CoopVecComponentType.Float16, CoopVecMatrixLayout.TrainingOptimal, false, 0);
+}
+
+CoopVec<half, N> activate<let N : int>(NtcNetwork net, CoopVec<half, N> y, bool int8)
+{
+    CoopVec<half, N> x;
+    for (int o = 0; o < N; ++o)
+        x[o] = half(hgelu_clamp(float(y[o]), int8, net.one));
+    return x;
+}
+
+// Weight and bias gradients of layer ``l`` added to the warp's slot; returns the input gradient.
+CoopVec<half, K> layer_backward<let K : int, let N : int>(NtcTrainState st, int l, int t, CoopVec<half, K> x,
+                                                         CoopVec<half, N> g)
+{
+    let slot = uint(t / 32) * uint(st.slot_bytes);
+    coopVecOuterProductAccumulate(g, x, st.grad_slots, slot + st.coop_weight_offsets[l], 0,
+                                  CoopVecMatrixLayout.TrainingOptimal, CoopVecComponentType.Float16);
+    coopVecReduceSumAccumulate(g, st.grad_slots, slot + st.slot_bias_start + st.coop_bias_offsets[l]);
+    return coopVecMatMul<half, K>(g, CoopVecComponentType.Float16, st.coop_weights, st.coop_weight_offsets[l],
+                                  CoopVecComponentType.Float16, CoopVecMatrixLayout.TrainingOptimal, true, 0);
+}
+
+CoopVec<half, K> through_activation<let K : int>(CoopVec<half, K> d, CoopVec<half, K> y)
+{
+    CoopVec<half, K> g;
+    for (int k = 0; k < K; ++k)
+        g[k] = half(float(d[k]) * hgelu_derivative(float(y[k])));
+    return g;
+}
+
+// Forward for batch texel ``t``, keeping layer inputs and pre-activations for the backward pass.
+NtcTrainForward forward_texel(NtcNetwork net, NtcTrainState st, int t)
 {
     let texel = st.texels[t];
     let color_mip = net.color_mips[texel.x];
@@ -189,60 +241,42 @@ void forward_texel(NtcNetwork net, NtcTrainState st, int t, out float pre[4][Ntc
     let position = net.positions[texel.x];
     encode_position(float(texel.y) * position.x, float(texel.z) * position.x, position.y, inputs);
 
-    float x[NtcMaxWidth] = {};
+    NtcTrainForward f = {};
     for (int i = 0; i < NtcInputs; ++i)
-        x[i] = quantize_input(inputs[i], net.stage, net.one);
-
-    float y[NtcMaxWidth];
-    let acts = t * NtcActs;
-    pre = {};
-    for (int l = 0; l < 4; ++l)
-    {
-        for (int k = 0; k < NtcLayerInputs[l]; ++k)
-            st.acts[acts + NtcActOffsets[l] + k] = x[k];
-        dense_layer(net, l, x, y);
-        pre[l] = y;
-        if (l < 3)
-        {
-            let int8 = net.stage == NtcStageInt8 || l == 2;
-            for (int o = 0; o < NtcLayerOutputs[l]; ++o)
-                x[o] = hgelu_clamp(y[o], int8, net.one);
-        }
-    }
+        f.x0[i] = half(quantize_input(inputs[i], net.stage, net.one));
+    let int8 = net.stage == NtcStageInt8;
+    f.y0 = layer_forward<48, 64>(st, 0, f.x0);
+    f.x1 = activate(net, f.y0, int8);
+    f.y1 = layer_forward<64, 48>(st, 1, f.x1);
+    f.x2 = activate(net, f.y1, int8);
+    f.y2 = layer_forward<48, 32>(st, 2, f.x2);
+    f.x3 = activate(net, f.y2, true);
+    f.y3 = layer_forward<32, 16>(st, 3, f.x3);
+    return f;
 }
 
-// Linear-space latent ``c`` from the network outputs, as the SDK's loss and decompression.
-float linear_latent(NtcNetwork net, float pre[4][NtcMaxWidth], int c)
+// Linear-space latent ``c`` from the network output ``o``, as the SDK's loss and decompression.
+float linear_latent(NtcNetwork net, float o, int c)
 {
-    let o = isfinite(pre[3][c]) ? pre[3][c] : 0.0;
-    return round_half(fma(o, net.mapping[c].x, net.mapping[c].y));
+    return round_half(fma(isfinite(o) ? o : 0.0, net.mapping[c].x, net.mapping[c].y));
 }
 
-// Backward for batch texel ``t`` from the gradient ``g`` at the network outputs
-// (already scaled by loss scale / batch): records output gradients per layer,
-// adds latent gradients when ``accumulate_latents``.
-void backward_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t, float pre[4][NtcMaxWidth],
-                    float g_out[NtcMaxWidth])
+// Backward for batch texel ``t`` from the gradient ``g_out`` at the network outputs
+// (already scaled by loss scale / batch): records it, adds weight gradients to the
+// warp's slot and latent gradients when ``accumulate_latents``.
+void backward_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t, NtcTrainForward f,
+                    float g_out[NtcOutputs])
 {
-    var g = g_out;
-    let grads = t * NtcGrads;
-    for (int l = 3; l >= 0; --l)
+    CoopVec<half, 16> g3;
+    for (int o = 0; o < NtcOutputs; ++o)
     {
-        let n_in = NtcLayerInputs[l];
-        let n_out = NtcLayerOutputs[l];
-        for (int o = 0; o < n_out; ++o)
-            st.grads[grads + NtcGradOffsets[l] + o] = g[o];
-        float back[NtcMaxWidth] = {};
-        let w = net.weight_offsets[l];
-        for (int k = 0; k < n_in; ++k)
-        {
-            float s = 0;
-            for (int o = 0; o < n_out; ++o)
-                s += net.weights[w + o * n_in + k] * g[o];
-            back[k] = l > 0 ? s * hgelu_derivative(pre[l - 1][k]) : s;
-        }
-        g = back;
+        st.output_grads[t * NtcOutputs + o] = g_out[o];
+        g3[o] = half(g_out[o]);
     }
+    let g2 = through_activation(layer_backward<32, 16>(st, 3, t, f.x3, g3), f.y2);
+    let g1 = through_activation(layer_backward<48, 32>(st, 2, t, f.x2, g2), f.y1);
+    let g0 = through_activation(layer_backward<64, 48>(st, 1, t, f.x1, g1), f.y0);
+    let d = layer_backward<48, 64>(st, 0, t, f.x0, g0);
 
     if (lp.accumulate_latents != 0)
     {
@@ -252,7 +286,7 @@ void backward_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t, f
         let v = (float(texel.z) + 0.5) / float(color_mip.y);
         float grad_inputs[NtcInputs] = {};
         for (int i = 0; i < NtcInputs; ++i)
-            grad_inputs[i] = g[i];
+            grad_inputs[i] = float(d[i]);
         backward_grid(net, st, color_mip.z, u, v, grad_inputs, 0);
         backward_grid(net, st, color_mip.z + 1, u, v, grad_inputs, NtcFeaturesPerMip);
     }
@@ -262,40 +296,60 @@ void backward_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t, f
 // reaches the outputs without the channel mapping scale, as in the SDK.
 void ntc_train_texel(NtcNetwork net, NtcTrainState st, NtcLossParams lp, int t)
 {
-    float pre[4][NtcMaxWidth];
-    forward_texel(net, st, t, pre);
+    let f = forward_texel(net, st, t);
     let texel = st.texels[t];
     let ref = st.reference_offsets[texel.x] + (texel.z * net.color_mips[texel.x].x + texel.y) * NtcLatents;
-    float g[NtcMaxWidth] = {};
+    float g[NtcOutputs] = {};
     float loss = 0;
     for (int c = 0; c < NtcLatents; ++c)
     {
-        let diff = linear_latent(net, pre, c) - st.reference[ref + c];
+        let diff = linear_latent(net, float(f.y3[c]), c) - st.reference[ref + c];
         loss += diff * diff;
         g[c] = 2.0 * diff * lp.gradient_scale;
     }
     st.texel_loss[t] = loss;
-    backward_texel(net, st, lp, t, pre, g);
+    backward_texel(net, st, lp, t, f, g);
 }
 
-// Partial gradient of parameter ``id.x`` over batch chunk ``id.y``, summed in texel order.
+// Linear-space latents of batch texel ``t`` as training computes them; needs ``prepare_network``.
+float[NtcLatents] ntc_train_latents(NtcNetwork net, NtcTrainState st, int t)
+{
+    let f = forward_texel(net, st, t);
+    float latents[NtcLatents] = {};
+    for (int c = 0; c < NtcLatents; ++c)
+        latents[c] = linear_latent(net, float(f.y3[c]), c);
+    return latents;
+}
+
+// Linear-space latents of batch texel ``t`` by the SDK decompression forward (``ntc_forward.slang``).
+float[NtcLatents] ntc_linear_latents(NtcNetwork net, NtcTrainState st, int t)
+{
+    let texel = st.texels[t];
+    float outputs[NtcOutputs];
+    forward(net, texel.x, texel.yz, outputs);
+    float latents[NtcLatents] = {};
+    for (int c = 0; c < NtcLatents; ++c)
+        latents[c] = linear_latent(net, outputs[c], c);
+    return latents;
+}
+
+float slot_value(NtcTrainState st, int slot, int index)
+{
+    let offset = uint(slot) * uint(st.slot_bytes) + uint(index) * 2;
+    let word = st.grad_slots.Load(offset & ~3u);
+    return f16tof32((offset & 2) != 0 ? word >> 16 : word & 0xffff);
+}
+
+// Partial gradient of parameter ``id.x`` over batch chunk ``id.y``: its warps' slots summed in order.
 void ntc_weight_chunk(NtcTrainState st, int2 id)
 {
     let p = id.x;
     let c = id.y;
-    let bias = p >= NtcBiasStart;
-    int layer = 3;
-    while (p < (bias ? NtcLayerBiasOffsets[layer] : NtcLayerWeightOffsets[layer]))
-        --layer;
-    let n_in = NtcLayerInputs[layer];
-    let o = bias ? p - NtcLayerBiasOffsets[layer] : (p - NtcLayerWeightOffsets[layer]) / n_in;
-    let k = bias ? 0 : (p - NtcLayerWeightOffsets[layer]) % n_in;
+    let index = st.slot_index[p];
+    let warps = st.chunk / 32;
     float s = 0;
-    for (int t = c * st.chunk; t < (c + 1) * st.chunk; ++t)
-    {
-        let g = st.grads[t * NtcGrads + NtcGradOffsets[layer] + o];
-        s += bias ? g : g * st.acts[t * NtcActs + NtcActOffsets[layer] + k];
-    }
+    for (int w = c * warps; w < (c + 1) * warps; ++w)
+        s += slot_value(st, w, index);
     st.partials[c * NtcParams + p] = s;
 }
 
@@ -474,4 +528,18 @@ void ntc_fake_quantize(NtcTrainState st, int half_offset, int fp8, int col)
 void ntc_clear_mask(NtcTrainState st, int i)
 {
     st.grad_mask[i] = 0;
+}
+
+// FP16 biases of the weight set from ``half_offset`` into ``biases``, two per thread: bias pair ``i``
+// in the parameter order of ``weights_q``, each layer's vector from ``coop_bias_offsets``.
+void ntc_pack_biases(NtcTrainState st, int half_offset, RWByteAddressBuffer biases, int i)
+{
+    let p = 2 * i;
+    int layer = 3;
+    while (p < NtcLayerBiasOffsets[layer] - NtcBiasStart)
+        --layer;
+    let o = p - (NtcLayerBiasOffsets[layer] - NtcBiasStart);
+    let a = f32tof16(st.weights_q[half_offset + NtcBiasStart + p]);
+    let b = f32tof16(st.weights_q[half_offset + NtcBiasStart + p + 1]);
+    biases.Store(uint(st.coop_bias_offsets[layer] + o * 2), a | (b << 16));
 }
