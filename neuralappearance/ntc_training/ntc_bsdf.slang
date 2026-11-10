@@ -76,8 +76,8 @@ void ntc_train_texel_bsdf<BsdfDecoder : IBsdfDecoder<NtcLatents>, LossFunction :
     for (int c = 0; c < NtcLatents; ++c)
         g[c] = pair.d[c] * lp.gradient_scale;
 
-    // Control variate: the dense latents minimize this loss, so their gradient on the
-    // same sample has expectation zero and carries most of the direction noise.
+    // Control variate: the gradient at the dense latents on the same sample shares most of
+    // the latent gradient noise. Through the network its mean is not zero.
     if (control_variate != 0)
     {
         let texel = st.texels[t];

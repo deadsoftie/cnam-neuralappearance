@@ -353,12 +353,13 @@ void ntc_weight_chunk(NtcTrainState st, int2 id)
     st.partials[c * NtcParams + p] = s;
 }
 
-void ntc_weight_sum(NtcTrainState st, int p)
+// ``accumulate``: add to the gradient of the step's earlier batches.
+void ntc_weight_sum(NtcTrainState st, int accumulate, int p)
 {
     float s = 0;
     for (int c = 0; c < st.batch / st.chunk; ++c)
         s += st.partials[c * NtcParams + p];
-    st.weight_grad[p] = s;
+    st.weight_grad[p] = accumulate != 0 ? st.weight_grad[p] + s : s;
 }
 
 // Constants of ``PrepareAdamConstants`` and the update kind.

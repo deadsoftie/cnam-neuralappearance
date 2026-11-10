@@ -11,7 +11,8 @@ iteration, where the loss read back asynchronously sets the next loss scale. The
 L2 against a reference pyramid; its gradient reaches the network output without the channel mapping
 scale, as in the SDK. With a ``BsdfLoss`` the loss is the E2E BSDF loss instead, on the same texels;
 its gradient reaches the outputs the same way, minus the gradient at the reference pyramid when one
-is given (control variate).
+is given (control variate). ``micro_batches`` above 1 averages the gradients of that many batches,
+drawn with the same weights, into one update (not in the SDK).
 """
 
 from __future__ import annotations
@@ -69,6 +70,8 @@ class Settings:
     valid_channels: int = 8
     block_steps: int = 16
     blocks_in_flight: int = 8
+    train_latents: bool = True
+    micro_batches: int = 1
 
 
 @dataclass
@@ -358,20 +361,23 @@ class Trainer:
         self.prepare_network(half)
 
         self.dispatch(m.ntc_clear_mask, self.state_fields, spy.grid(((self.total_pixels + 31) // 32,)))
-        self.sampling['seed'] = self.rng.next_uint32()
-        self.dispatch(m.ntc_sample, self.sampling, spy.grid((s.batch,)))
-
         stage = STAGE_INT8 if quantize_int8 else STAGE_FP8
-        loss_params = {'gradient_scale': float(F32(self.loss_scale) / F32(s.batch)),
-                       'accumulate_latents': int(step < freeze_step)}
+        loss_params = {'gradient_scale': float(F32(self.loss_scale) / F32(s.batch * s.micro_batches)),
+                       'accumulate_latents': int(step < freeze_step and s.train_latents)}
         network = self.network(stage, half)
-        if self.bsdf is None:
-            self.dispatch(m.ntc_train_texel, network, self.state_fields, loss_params, spy.grid((s.batch,)))
-        else:
-            self.bsdf.prepare(network, self.state_fields, self.dispatch)
-            self.bsdf.train(network, self.state_fields, loss_params, self.control_variate, self.dispatch)
-        self.dispatch(m.ntc_weight_chunk, self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
-        self.dispatch(m.ntc_weight_sum, self.state_fields, spy.grid((NUM_PARAMS,)))
+        for micro in range(s.micro_batches):
+            if micro:
+                self.encoder.clear_buffer(self.buffers['grad_slots'])
+                self.encoder.global_barrier()
+            self.sampling['seed'] = self.rng.next_uint32()
+            self.dispatch(m.ntc_sample, self.sampling, spy.grid((s.batch,)))
+            if self.bsdf is None:
+                self.dispatch(m.ntc_train_texel, network, self.state_fields, loss_params, spy.grid((s.batch,)))
+            else:
+                self.bsdf.prepare(network, self.state_fields, self.dispatch)
+                self.bsdf.train(network, self.state_fields, loss_params, self.control_variate, self.dispatch)
+            self.dispatch(m.ntc_weight_chunk, self.state_fields, spy.grid((s.batch // s.chunk, NUM_PARAMS)))
+            self.dispatch(m.ntc_weight_sum, self.state_fields, int(micro > 0), spy.grid((NUM_PARAMS,)))
 
         network_lr = cosine(step, s.network_learning_rate, s.steps)
         self.dispatch(m.ntc_network_adam, self.state_fields,
@@ -379,7 +385,7 @@ class Trainer:
                       spy.grid((NUM_PARAMS,)))
         if step == freeze_step:
             self.dispatch(m.ntc_freeze, self.state_fields, spy.grid((self.total_pixels * self.num_features,)))
-        elif step < freeze_step:
+        elif step < freeze_step and s.train_latents:
             grid_lr = cosine(step, s.grid_learning_rate, s.steps)
             self.dispatch(m.ntc_latent_adam, self.network(stage, half), self.state_fields,
                           adam_constants(s, self.loss_scale, step + 1, grid_lr, self.rng.next_uint32(), 0),
@@ -427,15 +433,16 @@ class Trainer:
             on_iteration(item)
 
     def run(self, on_iteration: Callable[[Iteration], None] | None = None) -> list[Iteration]:
-        """Steps in blocks of ``block_steps`` per command buffer, up to ``blocks_in_flight`` queued; the device
-        is waited for only at the end of each iteration, where the loss scale changes."""
+        """Steps in blocks of ``block_steps`` batches per command buffer, up to ``blocks_in_flight`` queued; the
+        device is waited for only at the end of each iteration, where the loss scale changes."""
+        block = max(1, self.s.block_steps // self.s.micro_batches)
         while self.step < self.s.steps:
             start, first, end = time.perf_counter(), self.step, self.iteration_end()
             in_flight: list[int] = []
             while self.step < end:
                 if len(in_flight) == self.s.blocks_in_flight:
                     self.fence.wait(in_flight.pop(0))
-                in_flight.append(self.submit(min(self.s.block_steps, end - self.step)))
+                in_flight.append(self.submit(min(block, end - self.step)))
             self.fence.wait(in_flight[-1])
             self.finish_iteration(start, end - first, on_iteration)
         return self.history

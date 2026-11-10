@@ -7,7 +7,8 @@ importance-sampled ``wo`` where the strategy asks for it, the reference BSDF
 prefiltered for the texel's color mip (``fill_target_bsdf_lod``), all with the
 dense run's data generation settings and a sample generator seeded with the
 fine-tune seed. At mip 0 the prefilter width is zero and the target is one
-evaluation (``ntc_bsdf_target.slang``) unless ``prefilter_mip0``. The frozen BSDF
+evaluation (``ntc_bsdf_target.slang``) unless ``prefilter_mip0``; ``prefilter_samples``
+replaces the dense run's prefilter sample count. The frozen BSDF
 decoder of the dense checkpoint evaluates the decoded latent; the dense loss
 function compares.
 """
@@ -29,7 +30,7 @@ class BsdfLoss:
     loss_divisor = 1
 
     def __init__(self, device: spy.Device, config: dict, reference_materials: Any, decoder: Any, seed: int,
-                 batch: int, prefilter_mip0: bool = False):
+                 batch: int, prefilter_mip0: bool = False, prefilter_samples: int | None = None):
         from datagen import FalcorBsdfDataGenerator
         from training import LossFunction, TrainingTargets
 
@@ -42,6 +43,8 @@ class BsdfLoss:
         self.generator = FalcorBsdfDataGenerator(device, config, reference_materials, 'BsdfDirectOptimization')
         self.generator.sample_generator.reshape((1, batch))
         self.datagen_config = self.generator.datagen_config.copy()
+        if prefilter_samples is not None:
+            self.datagen_config['num_prefilter_samples'] = prefilter_samples
         self.samples = spy.Tensor.empty(device, shape=(1, batch), dtype=self.generator.training_sample_type)
         self.texture_resolution = spy.Tensor.from_numpy(
             device, np.array([self.material.texture_resolution], np.int32))
