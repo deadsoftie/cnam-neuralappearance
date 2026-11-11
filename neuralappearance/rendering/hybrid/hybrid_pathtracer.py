@@ -379,15 +379,12 @@ class HybridPathTracer:
         assert self._buffers_shape is not None
         shape = self._buffers_shape
 
-        def dispatch(camera, color, iteration, fixed_mip_level, render_neural_material):
-            kernel.call(
-                camera,
-                color,
-                iteration,
-                fixed_mip_level,
-                render_neural_material,
-                tid=spy.grid(shape),
-            )
+        def dispatch(camera, color, iteration, fixed_mip_level, render_neural_material, command_encoder):
+            args = (camera, color, iteration, fixed_mip_level, render_neural_material)
+            if command_encoder is None:
+                kernel.call(*args, tid=spy.grid(shape))
+            else:
+                kernel.append_to(command_encoder, *args, tid=spy.grid(shape))
 
         return dispatch
 
@@ -398,6 +395,7 @@ class HybridPathTracer:
         iteration: int,
         fixed_mip_level: int,
         render_neural_material: bool,
+        command_encoder: spy.CommandEncoder | None = None,
     ) -> None:
         """Render one sample using pre-bound kernels."""
         assert self._bound is not None
@@ -407,9 +405,14 @@ class HybridPathTracer:
         if bound.megakernel is not None:
             # Single dispatch -- entire bounce loop on GPU.
             self._perf_begin()
-            bound.megakernel(camera, color, iteration, fixed_mip_level, render_neural_material)
+            bound.megakernel(
+                camera, color, iteration, fixed_mip_level, render_neural_material, command_encoder
+            )
             self._perf_end('megakernel')
             return
+
+        if command_encoder is not None:
+            raise ValueError('A command encoder is supported in megakernel mode only.')
 
         if any(
             value is None
@@ -512,11 +515,14 @@ class HybridPathTracer:
         iteration: int,
         fixed_mip_level: int = 0,
         render_neural_material: bool = False,
+        command_encoder: spy.CommandEncoder | None = None,
     ) -> None:
         """Render one sample, preparing kernels when configuration changes.
 
         Set ``scene`` first and use ``set_target_material()`` to configure the
         mode. Other property changes take effect on the next ``render()`` call.
+        With ``command_encoder`` (megakernel mode only) the dispatch is appended
+        to it instead of submitted; the caller submits it.
         """
         height, width = color.shape[0], color.shape[1]
 
@@ -532,4 +538,6 @@ class HybridPathTracer:
         camera.height = height
         camera.recompute()
 
-        self._render_one_sample(camera, color, iteration, fixed_mip_level, render_neural_material)
+        self._render_one_sample(
+            camera, color, iteration, fixed_mip_level, render_neural_material, command_encoder
+        )

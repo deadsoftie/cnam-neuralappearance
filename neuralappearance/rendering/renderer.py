@@ -218,8 +218,13 @@ class Renderer:
         neural_material: bool,
         spp: int,
         seed: int,
+        timestamps: spy.QueryPool | None = None,
     ) -> spy.Bitmap:
-        """Run one scene's hybrid path tracer for ``spp`` samples of render seed ``seed``."""
+        """Run one scene's hybrid path tracer for ``spp`` samples of render seed ``seed``.
+
+        With ``timestamps`` (at least ``2 * spp`` queries), sample ``i`` is
+        submitted alone, between GPU timestamps ``2 * i`` and ``2 * i + 1``.
+        """
         if not 0 < spp <= SEED_STRIDE:
             raise ValueError(f'spp must be in [1, {SEED_STRIDE}], got {spp}.')
         if not 0 <= seed < SEED_STRIDE:
@@ -228,7 +233,16 @@ class Renderer:
 
         for iteration in range(spp):
             sample_index = seed * SEED_STRIDE + iteration
-            hybrid_pt.render(camera, self.output_tensor, sample_index, mip_level, neural_material)
+            if timestamps is None:
+                hybrid_pt.render(camera, self.output_tensor, sample_index, mip_level, neural_material)
+            else:
+                encoder = self.device.create_command_encoder()
+                encoder.write_timestamp(timestamps, 2 * iteration)
+                hybrid_pt.render(
+                    camera, self.output_tensor, sample_index, mip_level, neural_material, encoder
+                )
+                encoder.write_timestamp(timestamps, 2 * iteration + 1)
+                self.device.submit_command_buffer(encoder.finish())
             self._utils_module.accumulator_update_and_output_inplace(
                 self.output_tensor, self._accumulator
             )
@@ -261,11 +275,13 @@ class Renderer:
         spp: int,
         seed: int,
         udim_id: int | None = None,
+        timestamps: spy.QueryPool | None = None,
     ) -> spy.Bitmap:
         """Render the BSDF image of a reference material.
 
         ``mip_level`` -1 selects the level per lookup from the ray footprint.
-        ``udim_id`` defaults to the material's first UDIM.
+        ``udim_id`` defaults to the material's first UDIM. ``timestamps`` as in
+        ``_render_with_accumulation``.
         """
         if udim_id is None:
             udim_id = material.udims[0]
@@ -283,6 +299,7 @@ class Renderer:
                 neural_material=False,
                 spp=spp,
                 seed=seed,
+                timestamps=timestamps,
             )
         finally:
             self._apply_udim_offset(self.reference_scene, udim_id, sign=-1.0)
@@ -326,6 +343,7 @@ class Renderer:
         spp: int,
         seed: int,
         udim_id: int | None = None,
+        timestamps: spy.QueryPool | None = None,
     ) -> spy.Bitmap:
         """Render the BSDF image of ``material`` as represented by ``neural_model``.
 
@@ -346,6 +364,7 @@ class Renderer:
                 neural_material=True,
                 spp=spp,
                 seed=seed,
+                timestamps=timestamps,
             )
         finally:
             self._apply_udim_offset(self.neural_scene, udim_id, sign=-1.0)
