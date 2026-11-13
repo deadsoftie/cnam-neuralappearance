@@ -13,3 +13,4 @@
 * `materials/Bark_*`: CC0 1.0 from [cgbookcase](https://www.cgbookcase.com/textures/bark-08)
 * `materials/FeauxLeather_*`: CC0 1.0 from [cgbookcase](https://www.cgbookcase.com/textures/faux-leather-tiles-02)
 * `materials/PatternedMetal_*`: CC0 1.0 from [cgbookcase](https://www.cgbookcase.com/textures/patterned-metal-01)
+* `materials/Marble012_*`: CC0 1.0 from [ambientCG](https://ambientcg.com/view?id=Marble012) (4K PNG: Color, NormalGL, Roughness)

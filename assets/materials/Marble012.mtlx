@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<materialx version="1.38">
+  <surfacematerial name="mtlxsurfacematerial" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="mtlxsurface" value="" />
+    <input name="displacementshader" type="displacementshader" value="" />
+  </surfacematerial>
+
+  <surface name="mtlxsurface" type="surfaceshader">
+    <input name="bsdf" type="BSDF" nodename="dielectric_diffuse_bsdf" value="" />
+    <input name="edf" type="EDF" value="" />
+    <input name="opacity" type="float" value="1" />
+  </surface>
+
+  <dielectric_bsdf name="dielectric_bsdf" type="BSDF">
+    <input name="roughness" type="vector2" nodename="square_roughness" />
+    <input name="ior" type="float" value="1.5" />
+    <input name="distribution" type="string" value="ggx" />
+    <input name="scatter_mode" type="string" value="R" />
+    <input name="normal" type="vector3" nodename="normalmap" />
+  </dielectric_bsdf>
+
+  <oren_nayar_diffuse_bsdf name="diffuse_bsdf" type="BSDF">
+    <input name="color" type="color3" nodename="basecolor_gamma" />
+    <input name="roughness" type="float" value="0" />
+    <input name="normal" type="vector3" nodename="normalmap" />
+  </oren_nayar_diffuse_bsdf>
+
+  <layer name="dielectric_diffuse_bsdf" type="BSDF">
+    <input name="top" type="BSDF" nodename="dielectric_bsdf" value="" />
+    <input name="base" type="BSDF" nodename="diffuse_bsdf" value="" />
+  </layer>
+
+  <tiledimage name="basecolor" type="color3">
+    <input name="file" type="filename" value="Marble012_basecolor.png" />
+    <input name="uvtiling" type="vector2" nodename="uv_scale" />
+  </tiledimage>
+  <power name="basecolor_gamma" type="vector3">
+    <input name="in1" type="vector3" nodename="basecolor" />
+    <input name="in2" type="vector3" value="2.2, 2.2, 2.2" />
+  </power>
+
+  <tiledimage name="roughness" type="float">
+    <input name="file" type="filename" value="Marble012_roughness.png" />
+    <input name="uvtiling" type="vector2" nodename="uv_scale" />
+  </tiledimage>
+  <power name="square_roughness" type="float">
+    <input name="in1" type="float" nodename="roughness" value="0" />
+    <input name="in2" type="float" value="2" />
+  </power>
+
+  <tiledimage name="normal" type="vector3">
+    <input name="file" type="filename" value="Marble012_normal.png" />
+    <input name="uvtiling" type="vector2" nodename="uv_scale" />
+  </tiledimage>
+  <normalmap name="normalmap" type="vector3">
+    <input name="in" type="vector3" nodename="normal" />
+  </normalmap>
+
+  <constant name="uv_scale" type="vector2">
+    <input name="value" type="vector2" value="1.0, -1.0" />
+  </constant>
+</materialx>
